@@ -3,14 +3,14 @@ library(moments)
 library(readxl)
 library(dplyr)
 library(gridExtra)
-library(openxlsx)  # For Excel export
+library(openxlsx)
 
 # Create PDF with full path
-pdf_path <- "C:/Users/rabae1g1/Desktop/all_histograms.pdf"
+pdf_path <- "" ## decide where to save the result
 pdf(pdf_path, width=10, height=8)
 
 # Load the dataset
-file_path <- ("C:/Users/rabae1g1/Desktop/Human NASH/final!!/final/final/clinical metadata and labparameters/ald/ALD_imputed_data.xlsx")
+file_path <- ""
 dataset <- read_excel(file_path)
 
 # Create dataframe to store skewness results
@@ -229,7 +229,7 @@ for(sheet in names(wb)) {
 }
 
 # Save the workbook
-output_path <- "C:/Users/rabae1g1/Desktop/Skewness_Analysis_Results.xlsx"
+output_path <- "" # decide where to save the results
 saveWorkbook(wb, output_path, overwrite = TRUE)
 
 cat("\nSkewness analysis results have been saved to:", output_path, "\n")
