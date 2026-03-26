@@ -1,0 +1,122 @@
+# Load required libraries
+library(openxlsx)
+library(car)  # Required for Levene's test
+
+# Add error handling for file reading
+tryCatch({
+  file_path <- ("file path to upload Excel table")
+  data <- read.xlsx(file_path)
+}, error = function(e) {
+  stop("Error reading the Excel file: ", e$message)
+})
+
+# Convert 'Group' to a factor and check for valid groups
+data$Group <- as.factor(data$Group)
+if(length(levels(data$Group)) < 2) stop("Need at least 2 groups for comparison")
+
+# Extract continuous variables from column in the Excel
+continuous_data <- data[, 4:24]
+
+# Initialize a data frame to store results
+levene_results <- data.frame(
+  Variable = character(),
+  Levene_statistic = numeric(),
+  P_value = numeric(),
+  Df = numeric(),
+  Variance_Ratio = numeric(),  # New column for variance ratio
+  Max_Variance_Group = character(),  # New column to store group with max variance
+  Min_Variance_Group = character(),  # New column to store group with min variance
+  stringsAsFactors = FALSE
+)
+
+# Function to calculate variance ratioA
+calculate_variance_ratio <- function(variable_data, group_data) {
+  # Calculate variance for each group
+  group_variances <- tapply(variable_data, group_data, var, na.rm = TRUE)
+  
+  # Find max and min variances and their corresponding groups
+  max_var <- max(group_variances, na.rm = TRUE)
+  min_var <- min(group_variances, na.rm = TRUE)
+  max_group <- names(group_variances)[which.max(group_variances)]
+  min_group <- names(group_variances)[which.min(group_variances)]
+  
+  # Calculate variance ratio
+  variance_ratio <- max_var / min_var
+  
+  return(list(
+    ratio = variance_ratio,
+    max_group = max_group,
+    min_group = min_group
+  ))
+}
+
+# Function to perform Levene's test
+perform_levene_test <- function(variable_data, group_data) {
+  tryCatch({
+    # Remove any NA values
+    complete_cases <- complete.cases(variable_data, group_data)
+    variable_data <- variable_data[complete_cases]
+    group_data <- group_data[complete_cases]
+    
+    # Perform Levene's test
+    levene_test <- leveneTest(variable_data ~ group_data, center = mean)
+    return(levene_test)
+  }, error = function(e) {
+    warning(paste("Error in Levene's test for variable:", deparse(substitute(variable_data))))
+    return(NULL)
+  })
+}
+
+# Loop over each continuous variable
+for (i in 1:ncol(continuous_data)) {
+  var_name <- colnames(continuous_data)[i]
+  
+  # Print progress
+  cat(sprintf("\rProcessing variable %d of %d: %s", i, ncol(continuous_data), var_name))
+  
+  # Extract the variable's data
+  variable_data <- continuous_data[[i]]
+  
+  # Check if variable has variation
+  if (length(unique(na.omit(variable_data))) <= 1) {
+    warning(paste("Variable", var_name, "has no variation. Skipping."))
+    next
+  }
+  
+  # Perform Levene's test
+  test_result <- perform_levene_test(variable_data, data$Group)
+  
+  # Calculate variance ratio
+  var_ratio_result <- calculate_variance_ratio(variable_data, data$Group)
+  
+  if (!is.null(test_result)) {
+    # Extract test statistics and add variance ratio information
+    levene_results <- rbind(levene_results, data.frame(
+      Variable = var_name,
+      Levene_statistic = test_result[1, "F value"],
+      P_value = test_result[1, "Pr(>F)"],
+      Df = paste(test_result[1, "Df"], test_result[2, "Df"], sep = ", "),
+      Variance_Ratio = var_ratio_result$ratio,
+      Max_Variance_Group = var_ratio_result$max_group,
+      Min_Variance_Group = var_ratio_result$min_group
+    ))
+  }
+}
+
+# Add output file path
+output_file_path <- "File path to download the result in Excel"
+
+# Write results to Excel with error handling
+tryCatch({
+  write.xlsx(levene_results, output_file_path)
+  cat("\nResults successfully saved to:", output_file_path, "\n")
+}, error = function(e) {
+  stop("Error writing to Excel file: ", e$message)
+})
+
+# Print summary statistics
+cat("\nAnalysis Summary:\n")
+cat("Total variables analyzed:", nrow(levene_results), "\n")
+cat("Variables with unequal variances (p < 0.05):", sum(levene_results$P_value < 0.05), "\n")
+cat("Mean variance ratio:", mean(levene_results$Variance_Ratio), "\n")
+cat("Median variance ratio:", median(levene_results$Variance_Ratio), "\n")
