@@ -1,0 +1,135 @@
+# Load required libraries
+library(openxlsx)
+
+# Add error handling for file reading
+tryCatch({
+  file_path <- ("file path to upload data in Excel")
+  data <- read.xlsx(file_path, check.names = FALSE)  # FIX: preserve original column names
+}, error = function(e) {
+  stop("Error reading the Excel file: ", e$message)
+})
+
+# Convert 'Group' to a factor and check for valid groups
+data$Group <- as.factor(data$Group)
+if(length(levels(data$Group)) < 2) stop("Need at least 2 groups for comparison")
+
+# Extract continuous variables from column x to x
+continuous_data <- data[, 4:24]
+original_names  <- colnames(continuous_data)  # FIX: save original names before anything can mangle them
+
+# ── Calculate sample size per group and their ratio ──────────────────────────
+group_counts      <- table(data$Group)
+max_n             <- max(group_counts)
+min_n             <- min(group_counts)
+sample_size_ratio <- max_n / min_n
+
+cat("Sample Size per Group:\n")
+print(group_counts)
+cat(sprintf("Sample Size Ratio (max n / min n): %.4f\n", sample_size_ratio))
+cat(sprintf("Sample Size Ratio Acceptable (< 1.5): %s\n\n",
+            ifelse(sample_size_ratio < 1.5, "Yes", "No")))
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Initialize a data frame to store results
+pr_f_values <- data.frame(
+  Variable              = character(),
+  PrF                   = numeric(),
+  F_statistic           = numeric(),
+  Num_df                = numeric(),
+  Den_df                = numeric(),
+  Variance_Ratio        = numeric(),
+  T_test_Acceptable     = character(),
+  Sample_Size_Ratio     = numeric(),
+  SampleSize_Acceptable = character(),
+  stringsAsFactors = FALSE,
+  check.names = FALSE  # FIX: prevent mangling in results dataframe
+)
+
+# Function to perform F-test for variance between groups
+perform_f_test <- function(variable_data, group_data) {
+  tryCatch({
+    # Remove any NA values
+    complete_cases <- complete.cases(variable_data, group_data)
+    variable_data  <- variable_data[complete_cases]
+    group_data     <- group_data[complete_cases]
+    
+    # Calculate variances for each group
+    var_by_group   <- tapply(variable_data, group_data, var)
+    variance_ratio <- max(var_by_group) / min(var_by_group)
+    
+    # Per-variable sample size ratio (accounts for NAs)
+    n_by_group        <- tapply(variable_data, group_data, length)
+    var_sample_ratio  <- max(n_by_group) / min(n_by_group)
+    
+    # Perform the ANOVA
+    fit       <- lm(variable_data ~ group_data)
+    anova_res <- anova(fit)
+    
+    return(list(
+      anova_res         = anova_res,
+      variance_ratio    = variance_ratio,
+      sample_size_ratio = var_sample_ratio
+    ))
+  }, error = function(e) {
+    warning(paste("Error in F-test for variable:", deparse(substitute(variable_data))))
+    return(NULL)
+  })
+}
+
+# Loop over each continuous variable
+for (i in 1:ncol(continuous_data)) {
+  var_name <- original_names[i]  # FIX: use saved original names (e.g. "PI 40:5" not "PI.40.5")
+  
+  # Print progress
+  cat(sprintf("\rProcessing variable %d of %d: %s", i, ncol(continuous_data), var_name))
+  
+  # Extract the variable's data
+  variable_data <- continuous_data[[i]]
+  
+  # Check if variable has variation
+  if (length(unique(na.omit(variable_data))) <= 1) {
+    warning(paste("Variable", var_name, "has no variation. Skipping."))
+    next
+  }
+  
+  # Perform the F-test
+  test_result <- perform_f_test(variable_data, data$Group)
+  
+  if (!is.null(test_result)) {
+    anova_res        <- test_result$anova_res
+    variance_ratio   <- test_result$variance_ratio
+    var_sample_ratio <- test_result$sample_size_ratio
+    
+    pr_f_values <- rbind(pr_f_values, data.frame(
+      Variable              = var_name,
+      PrF                   = anova_res[1, "Pr(>F)"],
+      F_statistic           = anova_res[1, "F value"],
+      Num_df                = anova_res[1, "Df"],
+      Den_df                = anova_res["Residuals", "Df"],
+      Variance_Ratio        = variance_ratio,
+      T_test_Acceptable     = ifelse(variance_ratio   < 3,   "Yes", "No"),
+      Sample_Size_Ratio     = var_sample_ratio,
+      SampleSize_Acceptable = ifelse(var_sample_ratio < 1.5, "Yes", "No"),
+      stringsAsFactors = FALSE,
+      check.names = FALSE  # FIX: prevent mangling during rbind
+    ))
+  }
+}
+
+# Add output file path
+output_file_path <- "file path to download the results in Excel"
+
+# Write results to Excel with error handling
+tryCatch({
+  write.xlsx(pr_f_values, output_file_path)
+  cat("\nResults successfully saved to:", output_file_path, "\n")
+}, error = function(e) {
+  stop("Error writing to Excel file: ", e$message)
+})
+
+# Print summary statistics
+cat("\nAnalysis Summary:\n")
+cat("Total variables analyzed:                          ", nrow(pr_f_values), "\n")
+cat("Significant variables (p < 0.05):                  ", sum(pr_f_values$PrF < 0.05), "\n")
+cat("Variables suitable for t-test (variance ratio < 3):", sum(pr_f_values$Variance_Ratio < 3), "\n")
+cat("Variables with acceptable sample size ratio (< 1.5):", sum(pr_f_values$Sample_Size_Ratio < 1.5), "\n")
