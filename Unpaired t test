@@ -1,0 +1,152 @@
+# Load required libraries
+library(openxlsx)
+library(stats)
+
+# Read the data
+tryCatch({
+  file_path <- "File path to upload Excel file"
+  data <- read.xlsx(file_path)
+}, error = function(e) {
+  stop("Error reading the Excel file: ", e$message)
+})
+
+
+
+# Convert Group to factor
+data$Group <- as.factor(data[[2]])  # Assuming Group is in column 2
+if(length(levels(data$Group)) != 2) stop("Unpaired t-test requires exactly 2 groups")
+
+# Extract continuous variables from the Excel
+continuous_data <- data[, 4:24]
+
+# Initialize results dataframe
+ttest_results <- data.frame(
+  Variable = character(),
+  T_statistic = numeric(),
+  Raw_P_value = numeric(),
+  FDR_P_value = numeric(),
+  Mean_Group1 = numeric(),
+  Mean_Group2 = numeric(),
+  SD_Group1 = numeric(),
+  SD_Group2 = numeric(),
+  N_Group1 = numeric(),
+  N_Group2 = numeric(),
+  CI_Lower = numeric(),
+  CI_Upper = numeric(),
+  Cohens_d = numeric(),  # Added here
+  stringsAsFactors = FALSE
+)
+
+# Function to perform unpaired t-test and calculate Cohen's d
+perform_ttest <- function(variable_data, group_data) {
+  tryCatch({
+    # Perform unpaired t-test with equal variance assumption
+    test_result <- t.test(variable_data ~ group_data, var.equal = TRUE)
+    
+    # Calculate group means and SDs
+    group_levels <- levels(group_data)
+    mean1 <- mean(variable_data[group_data == group_levels[1]], na.rm = TRUE)
+    mean2 <- mean(variable_data[group_data == group_levels[2]], na.rm = TRUE)
+    sd1 <- sd(variable_data[group_data == group_levels[1]], na.rm = TRUE)
+    sd2 <- sd(variable_data[group_data == group_levels[2]], na.rm = TRUE)
+    n1 <- sum(!is.na(variable_data[group_data == group_levels[1]]))
+    n2 <- sum(!is.na(variable_data[group_data == group_levels[2]]))
+    
+    # Calculate Cohen's d
+    pooled_sd <- sqrt(((n1 - 1) * sd1^2 + (n2 - 1) * sd2^2) / (n1 + n2 - 2))
+    cohens_d <- (mean1 - mean2) / pooled_sd
+    
+    return(list(
+      test = test_result,
+      means = c(mean1, mean2),
+      sds = c(sd1, sd2),
+      ns = c(n1, n2),
+      cohens_d = cohens_d
+    ))
+  }, error = function(e) {
+    warning(paste("Error in t-test for variable:", deparse(substitute(variable_data))))
+    return(NULL)
+  })
+}
+
+# Get group names
+group_names <- levels(data$Group)
+
+# Loop through variables
+for (i in 1:ncol(continuous_data)) {
+  var_name <- colnames(continuous_data)[i]
+  
+  # Print progress
+  cat(sprintf("\rProcessing variable %d of %d: %s", i, ncol(continuous_data), var_name))
+  
+  # Get variable data
+  variable_data <- continuous_data[[i]]
+  
+  # Check for variation
+  if (length(unique(na.omit(variable_data))) <= 1) {
+    warning(paste("\nVariable", var_name, "has no variation. Skipping."))
+    next
+  }
+  
+  # Perform t-test
+  test_results <- perform_ttest(variable_data, data$Group)
+  
+  if (!is.null(test_results)) {
+    # Store results
+    ttest_results <- rbind(ttest_results, data.frame(
+      Variable = var_name,
+      T_statistic = test_results$test$statistic,
+      Raw_P_value = test_results$test$p.value,
+      FDR_P_value = NA,  # Will be filled later
+      Mean_Group1 = test_results$means[1],
+      Mean_Group2 = test_results$means[2],
+      SD_Group1 = test_results$sds[1],
+      SD_Group2 = test_results$sds[2],
+      N_Group1 = test_results$ns[1],
+      N_Group2 = test_results$ns[2],
+      CI_Lower = test_results$test$conf.int[1],
+      CI_Upper = test_results$test$conf.int[2],
+      Cohens_d = test_results$cohens_d
+    ))
+  }
+}
+
+# Apply FDR correction
+ttest_results$FDR_P_value <- p.adjust(ttest_results$Raw_P_value, method = "fdr")
+
+# Rename columns to include group names
+colnames(ttest_results)[colnames(ttest_results) == "Mean_Group1"] <- paste0("Mean_", group_names[1])
+colnames(ttest_results)[colnames(ttest_results) == "Mean_Group2"] <- paste0("Mean_", group_names[2])
+colnames(ttest_results)[colnames(ttest_results) == "SD_Group1"] <- paste0("SD_", group_names[1])
+colnames(ttest_results)[colnames(ttest_results) == "SD_Group2"] <- paste0("SD_", group_names[2])
+colnames(ttest_results)[colnames(ttest_results) == "N_Group1"] <- paste0("N_", group_names[1])
+colnames(ttest_results)[colnames(ttest_results) == "N_Group2"] <- paste0("N_", group_names[2])
+
+# Create workbook for output
+wb <- createWorkbook()
+
+# Add results sheet
+addWorksheet(wb, "t_test_Results")
+writeData(wb, "t_test_Results", ttest_results)
+
+# Save workbook
+output_file_path <- "File path to download the result in Excel"
+tryCatch({
+  saveWorkbook(wb, output_file_path, overwrite = TRUE)
+  cat("\nResults successfully saved to:", output_file_path, "\n")
+}, error = function(e) {
+  stop("\nError writing to Excel file: ", e$message)
+})
+
+# Print summary
+cat("\nAnalysis Summary:\n")
+cat("Total variables analyzed:", nrow(ttest_results), "\n")
+cat("Significant variables (raw p < 0.05):", sum(ttest_results$Raw_P_value < 0.05), "\n")
+cat("Significant variables after FDR correction (q < 0.05):", sum(ttest_results$FDR_P_value < 0.05), "\n")
+
+# Sort significant results by FDR-adjusted p-values
+significant_results <- ttest_results[ttest_results$FDR_P_value < 0.05, ]
+significant_results <- significant_results[order(significant_results$FDR_P_value), ]
+
+cat("\nTop 10 most significant variables (FDR-adjusted):\n")
+print(head(significant_results[, c("Variable", "Raw_P_value", "FDR_P_value", "T_statistic", "Cohens_d")], 10))
