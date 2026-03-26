@@ -1,0 +1,51 @@
+# Load necessary libraries
+library(readxl)
+library(car)
+
+# Load the data from the Excel file
+file_path <- "File path to upload the Excel file"
+data <- read_excel(file_path, sheet = 1)
+
+# Clean column names: replace spaces and special characters with underscores
+names(data) <- make.names(names(data), unique = TRUE)
+
+# List of covariates
+covariates <- c( "Example 1", "Example 2")
+
+# 1. Check for correlations among covariates
+correlation_matrix <- cor(data[, covariates], use = "complete.obs")
+print("Correlation Matrix:")
+print(correlation_matrix)
+
+# 2. Calculate VIF using the correlation matrix directly
+# This approach doesn't require a dependent variable
+vif_from_cor <- function(cor_matrix) {
+  # Diagonal elements of the inverse correlation matrix are the VIFs
+  vif_values <- diag(solve(cor_matrix))
+  return(vif_values)
+}
+
+# Calculate VIF
+vif_values <- vif_from_cor(correlation_matrix)
+names(vif_values) <- covariates
+print("VIF Values:")
+print(vif_values)
+
+# 3. Alternative approach: Create a dummy dependent variable
+# and use one covariate as the response to check multicollinearity among the rest
+# This allows using the regular vif() function
+dummy_df <- data[, covariates]
+
+# Use the first covariate as a response to check collinearity among others
+formula_str <- paste(covariates[1], "~", paste(covariates[-1], collapse = " + "))
+dummy_model <- lm(formula_str, data = dummy_df)
+vif_alt <- vif(dummy_model)
+print("VIF Values (Alternative method):")
+print(vif_alt)
+
+# Interpretation guide
+cat("\nVIF Interpretation:\n")
+cat("VIF = 1: No correlation\n")
+cat("1 < VIF < 5: Moderate correlation (generally acceptable)\n")
+cat("5 ≤ VIF < 10: High correlation (potential multicollinearity)\n")
+cat("VIF ≥ 10: Very high correlation (severe multicollinearity)\n")
