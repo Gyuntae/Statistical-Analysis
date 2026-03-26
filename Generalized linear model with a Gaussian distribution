@@ -1,0 +1,157 @@
+
+# Load necessary libraries
+library(readxl)
+library(tidyverse)
+library(car)
+library(openxlsx)
+
+# Load the data from the Excel file
+file_path <- "file path to upload the data"
+data <- read_excel(file_path, sheet = 1)
+
+# Store original column names before renaming
+original_names <- names(data)
+safe_names <- make.names(names(data), unique = TRUE)
+names(data) <- safe_names
+
+# Create a lookup: safe name -> original name
+name_lookup <- setNames(original_names, safe_names)
+
+# Convert categorical variables to factors
+data$Group <- factor(data$Group)
+
+
+# List of dependent variables to analyze from the Excel
+dependent_vars <- colnames(data)[5:ncol(data)]
+
+# Initialize lists to store results
+results_list <- list()
+warning_list <- list()  # New list to store warnings
+
+# Function to check for model fitting issues
+check_model_fit <- function(model, var_name) {
+  issues <- character(0)
+  
+  # Check for convergence
+  if(!model$converged) {
+    issues <- c(issues, "Model failed to converge")
+  }
+  
+  # Check for complete or quasi-complete separation
+  if(any(abs(coef(model)) > 10)) {
+    issues <- c(issues, "Possible complete or quasi-complete separation")
+  }
+  
+  # Check for perfect multicollinearity
+  if(any(is.na(coef(model)))) {
+    issues <- c(issues, "Perfect multicollinearity detected")
+  }
+  
+  return(issues)
+}
+
+# Perform GLM for each dependent variable
+for (var in dependent_vars) {
+  cat(paste("\nAnalyzing variable:", var, "\n"))
+  
+  # Define the formula
+  formula <- as.formula(paste0("`", var, "` ~ Group + Covariate 1 + Covariate 2")) 
+  
+  # Capture warnings
+  withCallingHandlers({
+    tryCatch({
+      # Check for zero variance
+      if(var(data[[var]], na.rm = TRUE) == 0) {
+        warning_list[[var]] <- "Zero variance in dependent variable"
+        next
+      }
+      
+      # Fit the GLM
+      model <- glm(formula, 
+                   data = data, 
+                   family = gaussian(), 
+                   control = glm.control(epsilon = 1e-8, maxit = 200))
+      
+      # Check for model fitting issues
+      model_issues <- check_model_fit(model, var)
+      if(length(model_issues) > 0) {
+        warning_list[[var]] <- paste(model_issues, collapse = "; ")
+      }
+      
+      # Get model summary
+      model_summary <- summary(model)
+      
+      # Calculate Type III ANOVA
+      anova_results <- Anova(model, type = "III")
+      
+      # Extract coefficients and their statistics
+      coef_data <- data.frame(
+        Variable = name_lookup[var],
+        Term = rownames(model_summary$coefficients),
+        Estimate = model_summary$coefficients[,"Estimate"],
+        Std_Error = model_summary$coefficients[,"Std. Error"],
+        t_value = model_summary$coefficients[,"t value"],
+        p_value = model_summary$coefficients[,"Pr(>|t|)"],
+        Warning = if(var %in% names(warning_list)) warning_list[[var]] else NA
+      )
+      
+      # Extract ANOVA results
+      anova_data <- data.frame(
+        Variable = name_lookup[var],
+        Term = rownames(anova_results),
+        LR_Chisq = anova_results[,"LR Chisq"],
+        Df = anova_results[,"Df"],
+        P_Value_ANOVA = anova_results[,"Pr(>Chisq)"],
+        Warning = if(var %in% names(warning_list)) warning_list[[var]] else NA
+      )
+      
+      # Store results
+      results_list[[var]] <- list(
+        coefficients = coef_data,
+        anova = anova_data
+      )
+      
+    }, error = function(e) {
+      warning_list[[var]] <- paste("Error:", e$message)
+      cat("Error processing variable:", name_lookup[var], "\nError message:", e$message, "\n")
+    })
+  }, warning = function(w) {
+    if(!var %in% names(warning_list)) {
+      warning_list[[var]] <- character(0)
+    }
+    warning_list[[var]] <- c(warning_list[[var]], w$message)
+    invokeRestart("muffleWarning")
+  })
+}
+
+# Combine all results
+all_coefficients <- do.call(rbind, lapply(results_list, function(x) x$coefficients))
+all_anova <- do.call(rbind, lapply(results_list, function(x) x$anova))
+
+# Create warning summary (restore original names)
+warning_summary <- data.frame(
+  Variable = name_lookup[names(warning_list)],
+  Warnings = sapply(warning_list, paste, collapse = "; "),
+  stringsAsFactors = FALSE
+)
+
+# Create and save Excel workbook
+wb <- createWorkbook()
+addWorksheet(wb, "Model Coefficients")
+addWorksheet(wb, "ANOVA Results")
+addWorksheet(wb, "Warning Summary")  # New sheet for warnings
+
+writeData(wb, "Model Coefficients", all_coefficients)
+writeData(wb, "ANOVA Results", all_anova)
+writeData(wb, "Warning Summary", warning_summary)
+
+# Save the results
+output_file_path <- "File path to download the results in the Excel"
+saveWorkbook(wb, output_file_path, overwrite = TRUE)
+
+# Print summary of analysis
+cat("\nAnalysis Summary:\n")
+cat("Total variables analyzed:", length(dependent_vars), "\n")
+cat("Variables with warnings:", length(warning_list), "\n")
+cat("\nCommon warnings encountered:\n")
+print(table(unlist(warning_list)))
