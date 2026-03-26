@@ -1,0 +1,122 @@
+
+library(readxl)
+library(tidyverse)
+library(car)  # For Anova() function
+library(openxlsx)  # For writing Excel files
+library(sandwich)
+
+# Load the data from the Excel file
+file_path <- "File path to upload the Excel file"
+data <- read_excel(file_path, sheet = 1)
+
+# Store original column names before renaming
+original_names <- names(data)
+safe_names <- make.names(names(data))
+names(data) <- safe_names
+
+# Create a lookup: safe name -> original name
+name_lookup <- setNames(original_names, safe_names)
+
+# Convert categorical variables to factors
+data$Group <- factor(data$Group)
+
+
+# List of dependent variables to analyze from the Excel file
+dependent_vars <- colnames(data)[4:ncol(data)]
+
+# Initialize lists to store results
+results_list <- list()
+convergence_issues <- character()
+
+# Perform Gaussian GLM for each dependent variable
+for (var in dependent_vars) {
+  print(paste("Analyzing variable:", var))
+  
+  # Define the formula
+  formula <- as.formula(paste0(var, " ~ Group + Covariate 1 + Covariate 2"))
+  
+  # Fit the GLM with robust standard error calculation
+  tryCatch({
+    model <- glm(formula, 
+                 data = data, 
+                 family = gaussian(link = "identity"),
+                 control = glm.control(maxit = 500, epsilon = 1e-8, trace = TRUE))
+    
+    # Check convergence
+    if (!model$converged) {
+      convergence_issues <- c(convergence_issues, 
+                              paste("Failed to converge for variable:", name_lookup[var]))
+      next
+    }
+    
+    # Calculate robust standard errors
+    cov_matrix <- vcovHC(model, type = "HC3")
+    robust_se <- sqrt(diag(cov_matrix))
+   
+    
+    coef_data <- data.frame(
+      Variable = name_lookup[var],
+      Term = rownames(coef(summary(model))),
+      Estimate = coef(model),
+      Robust_Std_Error = robust_se,
+      t_value = coef(model) / robust_se,
+      p_value = 2 * pnorm(-abs(coef(model) / robust_se))
+    )
+    
+    # Perform ANOVA
+    anova_results <- Anova(model, type = "III", singular.ok = TRUE)
+    anova_data <- data.frame(
+      Variable = name_lookup[var],
+      Term = rownames(anova_results),
+      LR_Chisq = anova_results[, "LR Chisq"],
+      Df = anova_results[, "Df"],
+      P_Value_ANOVA = anova_results[, "Pr(>Chisq)"]
+    )
+    
+    # Get model fit statistics
+    fit_stats <- data.frame(
+      Variable = name_lookup[var],
+      AIC = AIC(model),
+      Deviance = model$deviance,
+      Null_Deviance = model$null.deviance,
+      Residual_Df = model$df.residual
+    )
+    
+    # Store all results
+    results_list[[var]] <- list(
+      coefficients = coef_data,
+      anova = anova_data,
+      fit_statistics = fit_stats
+    )
+    
+  }, error = function(e) {
+    print(paste("Error in analysis for variable:", name_lookup[var]))
+    print(e)
+  })
+}
+
+# Combine results
+all_coefficients <- do.call(rbind, lapply(results_list, function(x) x$coefficients))
+all_anova <- do.call(rbind, lapply(results_list, function(x) x$anova))
+all_fit_stats <- do.call(rbind, lapply(results_list, function(x) x$fit_statistics))
+
+# Create a workbook
+wb <- createWorkbook()
+
+# Add worksheets
+addWorksheet(wb, "Model Coefficients")
+addWorksheet(wb, "ANOVA Results")
+addWorksheet(wb, "Model Fit Statistics")
+addWorksheet(wb, "Convergence Issues")
+
+# Write data to worksheets
+writeData(wb, "Model Coefficients", all_coefficients)
+writeData(wb, "ANOVA Results", all_anova)
+writeData(wb, "Model Fit Statistics", all_fit_stats)
+writeData(wb, "Convergence Issues", data.frame(Issues = convergence_issues))
+
+# Save the workbook
+output_file_path <- "File path to download the result in the Excel"
+saveWorkbook(wb, output_file_path, overwrite = TRUE)
+
+cat("Complete Gaussian GLM results saved to", output_file_path, "\n")
