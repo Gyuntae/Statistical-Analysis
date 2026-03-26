@@ -1,0 +1,96 @@
+# Load necessary libraries
+library(readxl)
+library(writexl)
+library(onewaytests)
+library(stats)  
+library(rstatix)  
+
+# Add error handling for file reading
+tryCatch({
+  data <- read_excel("File path to upload the Excel file")
+}, error = function(e) {
+  stop("Error reading the Excel file: ", e$message)
+})
+
+# Select group column and continuous variables from the Excel
+group_col <- data[[2]]
+continuous_data <- data[,4:ncol(data)]
+
+# Function to apply Brown-Forsythe test
+apply_bf_test <- function(variable, group) {
+  tryCatch({
+    df <- data.frame(value = variable, group = group)
+    result <- bf.test(value ~ group, data = df)
+    return(result$p.value)
+  }, error = function(e) {
+    return(NA)  # Return NA if test fails
+  })
+}
+
+# Initialize results vectors for Brown-Forsythe test
+raw_p_values <- numeric(ncol(continuous_data))
+names(raw_p_values) <- colnames(continuous_data)
+
+# Store Games-Howell post-hoc results
+games_howell_results <- list()
+
+# Loop over variables
+for (i in 1:ncol(continuous_data)) {
+  variable <- continuous_data[[i]]
+  
+  # Perform Brown-Forsythe test if variable has enough unique values
+  raw_p_values[i] <- if (length(unique(variable)) > 1 && !all(is.na(variable))) {
+    apply_bf_test(variable, group_col)
+  } else {
+    NA
+  }
+  
+  # If Brown-Forsythe test is significant, run Games-Howell post-hoc test
+  if (!is.na(raw_p_values[i]) && raw_p_values[i] < 0.05) {
+    tryCatch({
+      df <- data.frame(value = variable, group = group_col)
+      gh_result <- games_howell_test(df, value ~ group)
+      
+      # Add variable name to result
+      gh_result$Variable <- colnames(continuous_data)[i]
+      
+      # Append to results list
+      games_howell_results[[colnames(continuous_data)[i]]] <- gh_result
+    }, error = function(e) {
+      warning(paste("Error in Games-Howell test for variable:", colnames(continuous_data)[i], "\nError:", e$message))
+    })
+  }
+}
+
+# Calculate FDR-adjusted p-values for Brown-Forsythe test
+adjusted_p_values <- p.adjust(raw_p_values, method = "BH")
+
+# Create results dataframe for Brown-Forsythe test
+p_values_df <- data.frame(
+  Variable = colnames(continuous_data),
+  Raw_P_Value = raw_p_values,
+  FDR_Adjusted_P_Value = adjusted_p_values,
+  row.names = NULL
+)
+
+# Combine all Games-Howell post-hoc results into a single dataframe if available
+if (length(games_howell_results) > 0) {
+  games_howell_df <- do.call(rbind, games_howell_results)
+}
+
+# Add error handling for file writing
+tryCatch({
+  # Write Brown-Forsythe test results to Excel
+  write_xlsx(p_values_df, "File path where to save the results in Excel")
+  
+  # Write Games-Howell post-hoc test results if there are any
+  if (exists("games_howell_df") && is.data.frame(games_howell_df) && nrow(games_howell_df) > 0) {
+    write_xlsx(games_howell_df, "File path where to save the results in Excel")
+  } else {
+    cat("No significant Games-Howell post-hoc results to write.\n")
+  }
+}, error = function(e) {
+  stop("Error writing the Excel file: ", e$message)
+})
+
+cat("Analysis complete. Results saved to Excel files.\n")
