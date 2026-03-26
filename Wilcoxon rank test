@@ -1,0 +1,133 @@
+# Load required libraries
+library(openxlsx)
+library(stats)
+
+# Read the data
+tryCatch({
+  file_path <- "File path to upload the Excel file"
+  data <- read.xlsx(file_path)
+}, error = function(e) {
+  stop("Error reading the Excel file: ", e$message)
+})
+
+# Verify data structure
+#if(ncol(data) < 158) stop("Data has fewer columns than expected")
+
+# Convert Group to factor
+data$Group <- as.factor(data[[2]])  # Assuming Group is in column 2
+if(length(levels(data$Group)) != 2) stop("Wilcoxon rank-sum test requires exactly 2 groups")
+
+# Extract continuous variables from the Excel
+continuous_data <- data[, 4:24]
+
+# Initialize results dataframe
+wilcox_results <- data.frame(
+  Variable = character(),
+  W_statistic = numeric(),
+  Raw_P_value = numeric(),
+  FDR_P_value = numeric(),
+  Median_Group1 = numeric(),
+  Median_Group2 = numeric(),
+  N_Group1 = numeric(),
+  N_Group2 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Function to perform Wilcoxon rank-sum test
+perform_wilcox_test <- function(variable_data, group_data) {
+  tryCatch({
+    # Perform Wilcoxon rank-sum test
+    test_result <- wilcox.test(variable_data ~ group_data)
+    
+    # Calculate group medians
+    group_levels <- levels(group_data)
+    median1 <- median(variable_data[group_data == group_levels[1]], na.rm = TRUE)
+    median2 <- median(variable_data[group_data == group_levels[2]], na.rm = TRUE)
+    n1 <- sum(!is.na(variable_data[group_data == group_levels[1]]))
+    n2 <- sum(!is.na(variable_data[group_data == group_levels[2]]))
+    
+    return(list(
+      test = test_result,
+      medians = c(median1, median2),
+      ns = c(n1, n2)
+    ))
+  }, error = function(e) {
+    warning(paste("Error in Wilcoxon test for variable:", deparse(substitute(variable_data))))
+    return(NULL)
+  })
+}
+
+# Get group names
+group_names <- levels(data$Group)
+
+# Loop through variables
+for (i in 1:ncol(continuous_data)) {
+  var_name <- colnames(continuous_data)[i]
+  
+  # Print progress
+  cat(sprintf("\rProcessing variable %d of %d: %s", i, ncol(continuous_data), var_name))
+  
+  # Get variable data
+  variable_data <- continuous_data[[i]]
+  
+  # Check for variation
+  if (length(unique(na.omit(variable_data))) <= 1) {
+    warning(paste("\nVariable", var_name, "has no variation. Skipping."))
+    next
+  }
+  
+  # Perform Wilcoxon rank-sum test
+  test_results <- perform_wilcox_test(variable_data, data$Group)
+  
+  if (!is.null(test_results)) {
+    # Store results
+    wilcox_results <- rbind(wilcox_results, data.frame(
+      Variable = var_name,
+      W_statistic = test_results$test$statistic,
+      Raw_P_value = test_results$test$p.value,
+      FDR_P_value = NA,  # Will be filled later
+      Median_Group1 = test_results$medians[1],
+      Median_Group2 = test_results$medians[2],
+      N_Group1 = test_results$ns[1],
+      N_Group2 = test_results$ns[2]
+    ))
+  }
+}
+
+# Apply FDR correction
+wilcox_results$FDR_P_value <- p.adjust(wilcox_results$Raw_P_value, method = "fdr")
+
+# Rename columns to include group names
+colnames(wilcox_results)[colnames(wilcox_results) == "Median_Group1"] <- paste0("Median_", group_names[1])
+colnames(wilcox_results)[colnames(wilcox_results) == "Median_Group2"] <- paste0("Median_", group_names[2])
+colnames(wilcox_results)[colnames(wilcox_results) == "N_Group1"] <- paste0("N_", group_names[1])
+colnames(wilcox_results)[colnames(wilcox_results) == "N_Group2"] <- paste0("N_", group_names[2])
+
+# Create workbook for output
+wb <- createWorkbook()
+
+# Add results sheet
+addWorksheet(wb, "Wilcoxon_Results")
+writeData(wb, "Wilcoxon_Results", wilcox_results)
+
+# Save workbook
+output_file_path <- "File path to donwload the results in Excel"
+tryCatch({
+  saveWorkbook(wb, output_file_path, overwrite = TRUE)
+  cat("\nResults successfully saved to:", output_file_path, "\n")
+}, error = function(e) {
+  stop("\nError writing to Excel file: ", e$message)
+})
+
+# Print summary
+cat("\nAnalysis Summary:\n")
+cat("Total variables analyzed:", nrow(wilcox_results), "\n")
+cat("Significant variables (raw p < 0.05):", sum(wilcox_results$Raw_P_value < 0.05), "\n")
+cat("Significant variables after FDR correction (q < 0.05):", sum(wilcox_results$FDR_P_value < 0.05), "\n")
+
+# Sort significant results by FDR-adjusted p-values
+significant_results <- wilcox_results[wilcox_results$FDR_P_value < 0.05, ]
+significant_results <- significant_results[order(significant_results$FDR_P_value), ]
+
+cat("\nTop 10 most significant variables (FDR-adjusted):\n")
+print(head(significant_results[, c("Variable", "Raw_P_value", "FDR_P_value", "W_statistic")], 10))
