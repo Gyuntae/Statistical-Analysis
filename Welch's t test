@@ -1,0 +1,141 @@
+# Load required libraries
+library(openxlsx)
+library(stats)
+
+# Read the data
+tryCatch({
+  file_path <-"File path to upload the Excel"
+  data <- read.xlsx(file_path)
+}, error = function(e) {
+  stop("Error reading the Excel file: ", e$message)
+})
+
+# Convert Group to factor
+data$Group <- as.factor(data[[2]])  # Assuming Group is in column 2
+if(length(levels(data$Group)) != 2) stop("Welch's t-test requires exactly 2 groups")
+
+# Extract continuous variables from the Excel
+continuous_data <- data[, 4:24]
+
+# Initialize results dataframe
+welch_results <- data.frame(
+  Variable = character(),
+  T_statistic = numeric(),
+  P_value = numeric(),
+  Mean_Group1 = numeric(),
+  Mean_Group2 = numeric(),
+  SD_Group1 = numeric(),
+  SD_Group2 = numeric(),
+  N_Group1 = numeric(),
+  N_Group2 = numeric(),
+  CI_Lower = numeric(),
+  CI_Upper = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Function to perform Welch's t-test
+perform_welch_test <- function(variable_data, group_data) {
+  tryCatch({
+    # Perform Welch's t-test
+    test_result <- t.test(variable_data ~ group_data, var.equal = FALSE)
+    
+    # Calculate group means and SDs
+    group_levels <- levels(group_data)
+    mean1 <- mean(variable_data[group_data == group_levels[1]], na.rm = TRUE)
+    mean2 <- mean(variable_data[group_data == group_levels[2]], na.rm = TRUE)
+    sd1 <- sd(variable_data[group_data == group_levels[1]], na.rm = TRUE)
+    sd2 <- sd(variable_data[group_data == group_levels[2]], na.rm = TRUE)
+    n1 <- sum(!is.na(variable_data[group_data == group_levels[1]]))
+    n2 <- sum(!is.na(variable_data[group_data == group_levels[2]]))
+    
+    return(list(
+      test = test_result,
+      means = c(mean1, mean2),
+      sds = c(sd1, sd2),
+      ns = c(n1, n2)
+    ))
+  }, error = function(e) {
+    warning(paste("Error in Welch's t-test for variable:", deparse(substitute(variable_data))))
+    return(NULL)
+  })
+}
+
+# Get group names
+group_names <- levels(data$Group)
+
+# Loop through variables
+for (i in 1:ncol(continuous_data)) {
+  var_name <- colnames(continuous_data)[i]
+  
+  # Print progress
+  cat(sprintf("\rProcessing variable %d of %d: %s", i, ncol(continuous_data), var_name))
+  
+  # Get variable data
+  variable_data <- continuous_data[[i]]
+  
+  # Check for variation
+  if (length(unique(na.omit(variable_data))) <= 1) {
+    warning(paste("\nVariable", var_name, "has no variation. Skipping."))
+    next
+  }
+  
+  # Perform Welch's t-test
+  test_results <- perform_welch_test(variable_data, data$Group)
+  
+  if (!is.null(test_results)) {
+    # Store results
+    welch_results <- rbind(welch_results, data.frame(
+      Variable = var_name,
+      T_statistic = test_results$test$statistic,
+      P_value = test_results$test$p.value,
+      Mean_Group1 = test_results$means[1],
+      Mean_Group2 = test_results$means[2],
+      SD_Group1 = test_results$sds[1],
+      SD_Group2 = test_results$sds[2],
+      N_Group1 = test_results$ns[1],
+      N_Group2 = test_results$ns[2],
+      CI_Lower = test_results$test$conf.int[1],
+      CI_Upper = test_results$test$conf.int[2]
+    ))
+  }
+}
+
+# Add Benjamini-Hochberg FDR correction
+welch_results$FDR_adjusted_p <- p.adjust(welch_results$P_value, method = "BH")
+
+# Rename columns to include group names
+colnames(welch_results)[colnames(welch_results) == "Mean_Group1"] <- paste0("Mean_", group_names[1])
+colnames(welch_results)[colnames(welch_results) == "Mean_Group2"] <- paste0("Mean_", group_names[2])
+colnames(welch_results)[colnames(welch_results) == "SD_Group1"] <- paste0("SD_", group_names[1])
+colnames(welch_results)[colnames(welch_results) == "SD_Group2"] <- paste0("SD_", group_names[2])
+colnames(welch_results)[colnames(welch_results) == "N_Group1"] <- paste0("N_", group_names[1])
+colnames(welch_results)[colnames(welch_results) == "N_Group2"] <- paste0("N_", group_names[2])
+
+# Create workbook for output
+wb <- createWorkbook()
+
+# Add results sheet
+addWorksheet(wb, "Welch_t_test_Results")
+writeData(wb, "Welch_t_test_Results", welch_results)
+
+# Save workbook
+output_file_path <- "File path to donwload the results in Excel"
+tryCatch({
+  saveWorkbook(wb, output_file_path, overwrite = TRUE)
+  cat("\nResults successfully saved to:", output_file_path, "\n")
+}, error = function(e) {
+  stop("\nError writing to Excel file: ", e$message)
+})
+
+# Print summary
+cat("\nAnalysis Summary:\n")
+cat("Total variables analyzed:", nrow(welch_results), "\n")
+cat("Significant variables (p < 0.05):", sum(welch_results$P_value < 0.05), "\n")
+cat("Significant variables after FDR correction (q < 0.05):", sum(welch_results$FDR_adjusted_p < 0.05), "\n")
+
+# Sort significant results by FDR-adjusted p-values
+significant_results <- welch_results[welch_results$FDR_adjusted_p < 0.05, ]
+significant_results <- significant_results[order(significant_results$FDR_adjusted_p), ]
+
+cat("\nTop 10 most significant variables (FDR-adjusted):\n")
+print(head(significant_results[, c("Variable", "P_value", "FDR_adjusted_p", "T_statistic")], 10))
