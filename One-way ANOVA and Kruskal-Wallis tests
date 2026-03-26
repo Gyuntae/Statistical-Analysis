@@ -1,0 +1,188 @@
+library(stargazer)
+library(openxlsx)
+library(dplyr)
+library(broom)
+library(rstatix)
+library(tidyr)
+library(tibble)
+
+add_significance_stars <- function(p_value) {
+  if (is.na(p_value)) return("")
+  if (p_value < 0.0001) return("****")
+  if (p_value < 0.001) return("***")
+  if (p_value < 0.01) return("**")
+  if (p_value < 0.05) return("*")
+  return("")
+}
+
+pairwise_t_test_bh <- function(data, variable, group) {
+  tryCatch({
+    numeric_var <- as.numeric(data[[variable]])
+    raw_result <- pairwise.t.test(numeric_var, data[[group]], p.adjust.method = "none", pool.sd = TRUE)
+    bh_result  <- pairwise.t.test(numeric_var, data[[group]], p.adjust.method = "BH",   pool.sd = TRUE)
+    
+    raw_p_values <- as.data.frame(raw_result$p.value, check.names = FALSE)  # ← fix
+    bh_p_values  <- as.data.frame(bh_result$p.value,  check.names = FALSE)  # ← fix
+    groups <- rownames(raw_p_values)
+    
+    comparisons <- data.frame(group1=character(), group2=character(),
+                              raw_p=numeric(), p.adj=numeric(),
+                              comparison=character(), stringsAsFactors=FALSE,
+                              check.names=FALSE)  # ← fix
+    for (i in 1:nrow(raw_p_values)) {
+      for (j in 1:ncol(raw_p_values)) {
+        if (!is.na(raw_p_values[i,j])) {
+          comparisons <- rbind(comparisons, data.frame(
+            group1     = groups[i],
+            group2     = colnames(raw_p_values)[j],
+            raw_p      = raw_p_values[i,j],
+            p.adj      = bh_p_values[i,j],
+            comparison = paste(groups[i], colnames(raw_p_values)[j], sep="-"),
+            stringsAsFactors = FALSE,
+            check.names = FALSE  # ← fix
+          ))
+        }
+      }
+    }
+    return(comparisons)
+  }, error = function(e) {
+    warning(paste("Error in pairwise t-test for variable:", variable, "\nError:", e$message))
+    return(data.frame())
+  })
+}
+
+# ── Load data ──────────────────────────────────────────────────────────────
+file_path <- "File path to upload Excel"
+data <- read.xlsx(file_path, sheet = 1)
+raw_names <- unlist(read.xlsx(file_path, sheet = 1, rows = 1, colNames = FALSE))
+names(data) <- raw_names  # ← overwrite R-corrupted names with true Excel header names
+original_vars <- names(data)[4:ncol(data)]  # exact names from Excel, never modified
+
+# Create safe R names only for internal formula use
+safe_vars <- paste0("var_", seq_along(original_vars))
+
+safe_to_orig <- setNames(original_vars, safe_vars)
+orig_to_safe <- setNames(safe_vars, original_vars)
+
+data_safe <- data
+names(data_safe)[4:ncol(data_safe)] <- safe_vars
+
+# Run ANOVAs
+anova_results       <- list()
+kruskal_results     <- list()
+anova_posthoc_results <- list()
+dunn_results        <- list()
+
+for (i in seq_along(safe_vars)) {
+  safe_name <- safe_vars[i]
+  orig_name <- original_vars[i]
+  formula   <- as.formula(paste(safe_name, "~ Group"))
+  
+  # ANOVA
+  tryCatch({
+    anova_model   <- aov(formula, data = data_safe)
+    anova_summary <- summary(anova_model)
+    anova_results[[safe_name]] <- data.frame(
+      Variable       = orig_name,
+      Test           = "ANOVA",
+      Statistic      = anova_summary[[1]]$`F value`[1],
+      Statistic_Type = "F value",
+      P_value        = anova_summary[[1]]$`Pr(>F)`[1],
+      stringsAsFactors = FALSE,
+      check.names = FALSE  # ← fix
+    )
+    
+    posthoc <- pairwise_t_test_bh(data_safe, safe_name, "Group")
+    if (nrow(posthoc) > 0) {
+      posthoc$Variable <- orig_name
+      posthoc$Test     <- "ANOVA post-hoc"
+      group_means      <- tapply(data_safe[[safe_name]], data_safe$Group, mean, na.rm=TRUE)
+      posthoc$diff     <- sapply(1:nrow(posthoc), function(k)
+        group_means[posthoc$group2[k]] - group_means[posthoc$group1[k]])
+      anova_posthoc_results[[safe_name]] <- posthoc
+    }
+  }, error = function(e) warning(paste("ANOVA error:", orig_name, e$message)))
+  
+  # Kruskal-Wallis + Dunn
+  tryCatch({
+    kruskal <- kruskal.test(formula, data = data_safe)
+    kruskal_results[[safe_name]] <- data.frame(
+      Variable       = orig_name,
+      Test           = "Kruskal-Wallis",
+      Statistic      = kruskal$statistic,
+      Statistic_Type = "Chi-squared",
+      P_value        = kruskal$p.value,
+      stringsAsFactors = FALSE,
+      check.names = FALSE  # ← fix
+    )
+    
+    dunn_raw <- dunn_test(data=data_safe, formula=formula, p.adjust.method="none")
+    dunn_bh  <- dunn_test(data=data_safe, formula=formula, p.adjust.method="BH")
+    
+    dunn_combined <- dunn_raw %>%
+      select(group1, group2, statistic, p) %>%
+      rename(raw_p = p) %>%
+      left_join(dunn_bh %>% select(group1, group2, p.adj), by=c("group1","group2"))
+    
+    dunn_combined$Variable <- orig_name
+    dunn_combined$Test     <- "Dunn's test"
+    dunn_results[[safe_name]] <- dunn_combined
+  }, error = function(e) warning(paste("Kruskal error:", orig_name, e$message)))
+}
+
+# ── Combine results ────────────────────────────────────────────────────────
+initial_tests <- do.call(rbind, c(anova_results, kruskal_results)) %>%
+  group_by(Test) %>%
+  mutate(
+    FDR_P_value          = p.adjust(P_value, method="fdr"),
+    Original_Significance = sapply(P_value,     add_significance_stars),
+    FDR_Significance      = sapply(FDR_P_value, add_significance_stars)
+  ) %>%
+  ungroup()
+
+anova_posthoc_combined <- do.call(rbind, anova_posthoc_results)
+anova_posthoc_combined$raw_significance <- sapply(anova_posthoc_combined$raw_p, add_significance_stars)
+anova_posthoc_combined$adj_significance <- sapply(anova_posthoc_combined$p.adj, add_significance_stars)
+
+dunn_combined_all <- do.call(rbind, dunn_results)
+dunn_combined_all$raw_significance <- sapply(dunn_combined_all$raw_p, add_significance_stars)
+dunn_combined_all$adj_significance <- sapply(dunn_combined_all$p.adj, add_significance_stars)
+
+#Group Statistics: use original data with original column names
+group_stats <- data %>%
+  group_by(Group) %>%
+  summarise(across(all_of(original_vars),
+                   ~sprintf("%.2f±%.2f", mean(., na.rm=TRUE), sd(., na.rm=TRUE)))) %>%
+  as.data.frame(check.names = FALSE)  # ← prevents space/special char → dot conversion
+
+
+names(group_stats)[2:ncol(group_stats)] <- original_vars  # ← fix
+
+
+stopifnot(identical(names(group_stats)[2:ncol(group_stats)], original_vars))
+cat("Column names verified OK\n")
+
+wb <- createWorkbook()
+addWorksheet(wb, "Initial Tests with FDR")
+addWorksheet(wb, "ANOVA Post-hoc")
+addWorksheet(wb, "Dunn Post-hoc")
+addWorksheet(wb, "Group Statistics")
+
+writeData(wb, "Initial Tests with FDR", initial_tests)
+writeData(wb, "ANOVA Post-hoc",         anova_posthoc_combined)
+writeData(wb, "Dunn Post-hoc",          dunn_combined_all)
+writeData(wb, "Group Statistics",       group_stats)
+
+for (sheet in names(wb)) setColWidths(wb, sheet, cols=1:50, "auto")
+
+saveWorkbook(wb, "FIle path where to save the results in Excel", overwrite=TRUE)
+
+stargazer(as.data.frame(initial_tests),
+          type="html",
+          title="Statistical Analysis Results with Raw and FDR-Corrected P-values",
+          digits=4, summary=FALSE, rownames=FALSE,
+          notes=c("* p < 0.05; ** p < 0.01; *** p < 0.001; **** p < 0.0001",
+                  "Both raw p-values and FDR-corrected p-values are shown"),
+          out="C:/Users/rabae1g1/Desktop/analysis_results_with_raw_p.html")
+
+cat("Done. Variable names preserved exactly as in the input Excel file.\n")
