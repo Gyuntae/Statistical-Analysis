@@ -1,0 +1,1536 @@
+
+# Required libraries
+library(randomForest)
+library(readxl)
+library(caret)
+library(pROC)
+library(conflicted)
+conflicts_prefer(randomForest::importance)
+conflicts_prefer(caret::confusionMatrix)
+
+
+# Set output directory
+output_dir <- "File path where to download the results in a folder"
+
+# Create output directory if it doesn't exist
+if(!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  cat(paste0("Created output directory: ", output_dir, "\n"))
+} else {
+  cat(paste0("Using output directory: ", output_dir, "\n"))
+}
+
+# Create a subfolder for this analysis
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+analysis_dir <- file.path(output_dir, paste0("CRC", timestamp))
+
+dir.create(analysis_dir, recursive = TRUE)
+cat(paste0("Analysis results will be saved to: ", analysis_dir, "\n\n"))
+
+# Load your Excel file
+data <- read_excel("File path to upload the Excel file")
+
+# Separate features and group
+sample_names <- data$Sample
+group <- as.factor(data$Group)
+features <- data[, -c(1:2)]  # Remove Sample and Group columns
+
+# Fix column names: replace problematic characters
+original_names <- colnames(features)
+colnames(features) <- make.names(colnames(features), unique = TRUE)
+
+# Report any column name changes
+changed_names <- original_names != colnames(features)
+if(any(changed_names)) {
+  cat("\nColumn names were modified to be R-compatible:\n")
+  cat("(This is normal for names with spaces, hyphens, or starting with numbers)\n\n")
+  name_changes <- data.frame(
+    Original = original_names[changed_names],
+    Modified = colnames(features)[changed_names]
+  )
+  print(head(name_changes, 20))
+  if(sum(changed_names) > 20) {
+    cat(paste0("\n... and ", sum(changed_names) - 20, " more columns\n"))
+  }
+  cat("\n")
+}
+
+
+# Remove features with >80% missing values
+
+
+cat("=== STEP 1: Feature Filtering (>80% missing) ===\n")
+cat(paste0("Initial number of features: ", ncol(features), "\n"))
+
+# Calculate missingness percentage for each feature
+missing_pct <- colSums(is.na(features)) / nrow(features) * 100
+
+# Identify features to keep (≤80% missing)
+features_to_keep <- names(missing_pct[missing_pct <= 80])
+features_filtered <- features[, features_to_keep]
+
+cat(paste0("Features removed (>80% missing): ", ncol(features) - ncol(features_filtered), "\n"))
+cat(paste0("Features retained: ", ncol(features_filtered), "\n\n"))
+
+
+#Initial Data Validation
+
+
+cat("=== Data Validation ===\n")
+cat(paste0("Number of samples: ", nrow(features_filtered), "\n"))
+cat(paste0("Number of features: ", ncol(features_filtered), "\n"))
+cat(paste0("Groups: ", paste(levels(group), collapse = ", "), "\n"))
+cat(paste0("Group counts: ", paste(table(group), collapse = ", "), "\n\n"))
+
+
+# Cross-Validation Setup
+
+
+set.seed(123)  
+
+# Adjust number of folds based on sample size
+n_samples <- nrow(features_filtered)
+if(n_samples < 30) {
+  n_folds <- 5
+  cat("Small sample size detected. Using 5-fold cross-validation.\n")
+} else {
+  n_folds <- 10
+  cat("Using 10-fold cross-validation.\n")
+}
+
+# Create fold indices
+folds <- createFolds(group, k = n_folds, list = TRUE, returnTrain = FALSE)
+
+# Storage for results
+fold_importance <- list()
+fold_top10_features <- list()
+fold_rf_models_initial <- list()
+fold_overfitting_metrics <- list()
+
+# 
+# Log10 Transformation with LOD Imputation
+
+
+# Function to apply log10 transformation
+apply_log_transform <- function(data) {
+  # Check for zero or negative values
+  zero_neg_count <- sum(data <= 0, na.rm = TRUE)
+  if(zero_neg_count > 0) {
+    cat(paste0("  Note: Found ", zero_neg_count, " zero or negative values.\n"))
+    cat("  Adding small constant before log transformation.\n")
+  }
+  
+  # Log10 transform (add small constant to avoid log(0))
+  log_data <- log10(data + 1e-10)
+  return(log_data)
+}
+
+# calculate LOD (Limit of Detection) for imputation
+# LOD = minimum non-missing value / 5
+calculate_lod <- function(train_data) {
+  lod_values <- sapply(train_data, function(col) {
+    non_missing <- col[!is.na(col)]
+    if(length(non_missing) > 0) {
+      return(min(non_missing, na.rm = TRUE) / 5)
+    } else {
+      return(NA)
+    }
+  })
+  return(lod_values)
+}
+
+# Function to impute missing values using LOD from training data
+impute_with_lod <- function(data, lod_values) {
+  data_imputed <- data
+  for(col_name in names(lod_values)) {
+    if(!is.na(lod_values[col_name])) {
+      # Replace NA with LOD value
+      data_imputed[[col_name]][is.na(data_imputed[[col_name]])] <- lod_values[col_name]
+    }
+  }
+  return(data_imputed)
+}
+
+
+# Calculate Performance Metrics
+
+
+calculate_performance <- function(predictions, true_labels, probabilities = NULL) {
+  cm <- confusionMatrix(predictions, true_labels)
+  accuracy <- cm$overall['Accuracy']
+  
+  # For binary classification
+  if(length(levels(true_labels)) == 2) {
+    sensitivity <- cm$byClass['Sensitivity']
+    specificity <- cm$byClass['Specificity']
+    precision <- cm$byClass['Pos Pred Value']
+    f1 <- cm$byClass['F1']
+    
+    # Calculate AUC if probabilities provided
+    if(!is.null(probabilities)) {
+      roc_obj <- roc(as.numeric(true_labels), probabilities[, 2], quiet = TRUE)
+      auc_value <- auc(roc_obj)
+    } else {
+      auc_value <- NA
+    }
+    
+    return(list(
+      Accuracy = accuracy,
+      Sensitivity = sensitivity,
+      Specificity = specificity,
+      Precision = precision,
+      F1 = f1,
+      AUC = auc_value
+    ))
+  } else {
+    # Multi-class
+    return(list(
+      Accuracy = accuracy,
+      Sensitivity = mean(cm$byClass[, 'Sensitivity'], na.rm = TRUE),
+      Specificity = mean(cm$byClass[, 'Specificity'], na.rm = TRUE),
+      Precision = mean(cm$byClass[, 'Pos Pred Value'], na.rm = TRUE),
+      F1 = mean(cm$byClass[, 'F1'], na.rm = TRUE),
+      AUC = NA
+    ))
+  }
+}
+
+
+# Initial Random Forest on Each Fold
+
+
+cat("\n=== STEP 2: Running Initial Random Forest on Each Fold (No Data Leakage) ===\n\n")
+cat(paste0("Total samples: ", nrow(features_filtered), "\n"))
+cat(paste0("Total features: ", ncol(features_filtered), "\n\n"))
+
+for(i in 1:n_folds) {
+  cat(paste0("Processing Fold ", i, "/", n_folds, "...\n"))
+  
+  # Split data into training and testing BEFORE any transformation
+  test_idx <- folds[[i]]
+  train_idx <- setdiff(1:nrow(features_filtered), test_idx)
+  
+  train_features <- features_filtered[train_idx, ]
+  test_features <- features_filtered[test_idx, ]
+  train_group <- group[train_idx]
+  test_group <- group[test_idx]
+  
+  cat(paste0("  Training samples: ", length(train_idx), 
+             ", Test samples: ", length(test_idx), "\n"))
+  
+  
+  # STEP 1: Log10 transform SEPARATELY for train and test
+  cat("  Step 1: Applying log10 transformation...\n")
+  train_features_log <- apply_log_transform(train_features)
+  test_features_log <- apply_log_transform(test_features)
+  
+  # STEP 2: Calculate LOD from TRAINING data only
+  cat("  Step 2: Calculating LOD from training data (min/5)...\n")
+  lod_values <- calculate_lod(train_features_log)
+  
+  # STEP 3: Impute missing values using training LOD for both sets
+  cat("  Step 3: Imputing missing values with LOD...\n")
+  train_features_imputed <- impute_with_lod(train_features_log, lod_values)
+  test_features_imputed <- impute_with_lod(test_features_log, lod_values)
+  
+  # Check for remaining missing values
+  train_missing <- sum(is.na(train_features_imputed))
+  test_missing <- sum(is.na(test_features_imputed))
+  
+  if(train_missing > 0 || test_missing > 0) {
+    cat(paste0("  WARNING: ", train_missing, " missing values in train, ", 
+               test_missing, " in test after imputation.\n"))
+    cat("  Removing samples with remaining missing values...\n")
+    
+    # Remove rows with any remaining NAs
+    complete_train <- complete.cases(train_features_imputed)
+    complete_test <- complete.cases(test_features_imputed)
+    
+    train_features_imputed <- train_features_imputed[complete_train, ]
+    train_group <- train_group[complete_train]
+    test_features_imputed <- test_features_imputed[complete_test, ]
+    test_group <- test_group[complete_test]
+    
+    cat(paste0("  After removal: Training samples: ", nrow(train_features_imputed), 
+               ", Test samples: ", nrow(test_features_imputed), "\n"))
+  }
+  
+  # Combine with group for modeling
+  train_data <- cbind(Group = train_group, train_features_imputed)
+  test_data <- cbind(Group = test_group, test_features_imputed)
+  
+
+  # Train Random Forest model
+
+  
+  cat("  Step 4: Training Random Forest model...\n")
+  
+  # Adjust parameters for sample size
+  max_mtry <- min(sqrt(ncol(train_features_imputed)), ncol(train_features_imputed) - 1)
+  mtry_val <- max(1, floor(max_mtry))
+  ntree_val <- ifelse(nrow(train_data) < 50, 300, 500)
+  
+  # Train Random Forest model
+  rf_model <- tryCatch({
+    randomForest(
+      Group ~ .,
+      data = train_data,
+      importance = TRUE,
+      ntree = ntree_val,
+      mtry = mtry_val,
+      nodesize = max(1, floor(nrow(train_data) * 0.05))
+    )
+  }, error = function(e) {
+    cat(paste0("  Error in Fold ", i, ": ", e$message, "\n"))
+    return(NULL)
+  })
+  
+  if(is.null(rf_model)) {
+    cat("  Skipping this fold due to error.\n\n")
+    next
+  }
+  
+  # Store model with fold number as name
+  fold_rf_models_initial[[as.character(i)]] <- rf_model
+  
+
+  #  Calculate Training and Test Performance to detect overfitting
+
+  cat("  Step 5: Evaluating overfitting (Train vs Test performance)...\n")
+  
+  # Predict on TRAINING data
+  train_predictions <- predict(rf_model, train_data, type = "response")
+  train_probabilities <- NULL
+  if(length(levels(group)) == 2) {
+    train_probabilities <- predict(rf_model, train_data, type = "prob")
+  }
+  
+  # Predict on TEST data
+  test_predictions <- predict(rf_model, test_data, type = "response")
+  test_probabilities <- NULL
+  if(length(levels(group)) == 2) {
+    test_probabilities <- predict(rf_model, test_data, type = "prob")
+  }
+  
+  # Calculate performance metrics
+  train_perf <- calculate_performance(train_predictions, train_data$Group, train_probabilities)
+  test_perf <- calculate_performance(test_predictions, test_data$Group, test_probabilities)
+  
+  # Calculate overfitting gap
+  accuracy_gap <- train_perf$Accuracy - test_perf$Accuracy
+  
+  # Store overfitting metrics
+  overfitting_metrics <- data.frame(
+    Fold = i,
+    Train_Accuracy = train_perf$Accuracy,
+    Test_Accuracy = test_perf$Accuracy,
+    Accuracy_Gap = accuracy_gap,
+    Train_Sensitivity = train_perf$Sensitivity,
+    Test_Sensitivity = test_perf$Sensitivity,
+    Train_Specificity = train_perf$Specificity,
+    Test_Specificity = test_perf$Specificity,
+    Train_AUC = train_perf$AUC,
+    Test_AUC = test_perf$AUC
+  )
+  
+  fold_overfitting_metrics[[as.character(i)]] <- overfitting_metrics
+  
+  # Interpret overfitting
+  overfitting_status <- if(accuracy_gap > 0.15) {
+    " HIGH OVERFITTING"
+  } else if(accuracy_gap > 0.10) {
+    " MODERATE OVERFITTING"
+  } else if(accuracy_gap > 0.05) {
+    " SLIGHT OVERFITTING"
+  } else {
+    " GOOD GENERALIZATION"
+  }
+  
+  cat(paste0("  Train Accuracy: ", round(train_perf$Accuracy * 100, 2), "%\n"))
+  cat(paste0("  Test Accuracy:  ", round(test_perf$Accuracy * 100, 2), "%\n"))
+  cat(paste0("  Gap: ", round(accuracy_gap * 100, 2), "% - ", overfitting_status, "\n"))
+  
+  # Extract feature importance (EXPLICIT namespace to avoid rfPermute conflict)
+  importance_scores <- randomForest::importance(rf_model, type = 1)
+  
+  importance_df <- data.frame(
+    Feature = rownames(importance_scores),
+    Importance = importance_scores[, 1]
+  )
+  
+
+  importance_df <- importance_df[order(-importance_df$Importance), ]
+  
+  # Store full importance with fold number as name
+  fold_importance[[as.character(i)]] <- importance_df
+  
+  # Get top 10 features for this fold
+  top10 <- importance_df$Feature[1:min(10, nrow(importance_df))]
+  fold_top10_features[[as.character(i)]] <- top10
+  
+  cat(paste0("  Top 10 features identified for Fold ", i, "\n\n"))
+}
+
+cat(paste0("Successfully completed ", length(fold_top10_features), " out of ", n_folds, " folds.\n\n"))
+
+# Check if any folds succeeded
+if(length(fold_top10_features) == 0) {
+  cat("\n!!! ERROR: All folds failed during training !!!\n")
+  cat("This usually means there's a problem with your data.\n")
+  stop("Analysis cannot continue - all folds failed.")
+}
+
+
+cat("\n=== OVERFITTING ANALYSIS SUMMARY ===\n\n")
+
+# Combine overfitting metrics
+overfitting_df <- do.call(rbind, fold_overfitting_metrics)
+rownames(overfitting_df) <- NULL
+
+cat("Train vs Test Performance Across All Folds:\n")
+print(overfitting_df[, c("Fold", "Train_Accuracy", "Test_Accuracy", "Accuracy_Gap")])
+cat("\n")
+
+# Summary statistics
+mean_train_acc <- mean(overfitting_df$Train_Accuracy, na.rm = TRUE)
+mean_test_acc <- mean(overfitting_df$Test_Accuracy, na.rm = TRUE)
+mean_gap <- mean(overfitting_df$Accuracy_Gap, na.rm = TRUE)
+
+cat("Overall Summary:\n")
+cat(sprintf("  Mean Training Accuracy: %.2f%% (± %.2f%%)\n", 
+            mean_train_acc * 100, 
+            sd(overfitting_df$Train_Accuracy, na.rm = TRUE) * 100))
+cat(sprintf("  Mean Test Accuracy:     %.2f%% (± %.2f%%)\n", 
+            mean_test_acc * 100, 
+            sd(overfitting_df$Test_Accuracy, na.rm = TRUE) * 100))
+cat(sprintf("  Mean Overfitting Gap:   %.2f%% (± %.2f%%)\n", 
+            mean_gap * 100, 
+            sd(overfitting_df$Accuracy_Gap, na.rm = TRUE) * 100))
+
+# Overall interpretation
+if(mean_gap > 0.15) {
+  cat("\n WARNING: Model shows HIGH overfitting across folds.\n")
+  cat("   Consider: reducing model complexity, feature selection, or regularization.\n\n")
+} else if(mean_gap > 0.10) {
+  cat("\n CAUTION: Model shows MODERATE overfitting.\n")
+  cat("   Consider: additional feature selection or model tuning.\n\n")
+} else if(mean_gap > 0.05) {
+  cat("\n Model shows SLIGHT overfitting - generally acceptable.\n\n")
+} else {
+  cat("\n EXCELLENT: Model generalizes well with minimal overfitting.\n\n")
+}
+
+
+# Build NEW Random Forest Models Using Top 10 Features (NO LEAKAGE)
+
+
+cat("\n=== STEP 3: Building Random Forest with Top 10 Features from Each Fold ===\n\n")
+
+# Storage for new models and their performance
+fold_refined_models <- list()
+fold_performance <- list()
+fold_predictions <- list()
+fold_probabilities <- list()
+fold_refined_overfitting <- list()  # NEW: Overfitting for refined models
+
+# Loop through successful folds only
+for(fold_name in names(fold_top10_features)) {
+  fold_num <- as.numeric(fold_name)
+  
+  cat(paste0("Building model with top 10 features from Fold ", fold_num, "...\n"))
+  
+  top10_features <- fold_top10_features[[fold_name]]
+  
+  # Split data BEFORE transformation (using original filtered features)
+  test_idx <- folds[[fold_num]]
+  train_idx <- setdiff(1:nrow(features_filtered), test_idx)
+  
+  # Select only top 10 features
+  train_features <- features_filtered[train_idx, top10_features]
+  test_features <- features_filtered[test_idx, top10_features]
+  train_group <- group[train_idx]
+  test_group <- group[test_idx]
+  
+  # Apply preprocessing pipeline (NO LEAKAGE)
+  train_features_log <- apply_log_transform(train_features)
+  test_features_log <- apply_log_transform(test_features)
+  
+  lod_values <- calculate_lod(train_features_log)
+  
+  train_features_imputed <- impute_with_lod(train_features_log, lod_values)
+  test_features_imputed <- impute_with_lod(test_features_log, lod_values)
+  
+  # Handle any remaining NAs
+  complete_train <- complete.cases(train_features_imputed)
+  complete_test <- complete.cases(test_features_imputed)
+  
+  train_features_imputed <- train_features_imputed[complete_train, ]
+  train_group <- train_group[complete_train]
+  test_features_imputed <- test_features_imputed[complete_test, ]
+  test_group <- test_group[complete_test]
+  
+  # Combine with group
+  train_data <- cbind(Group = train_group, train_features_imputed)
+  test_data <- cbind(Group = test_group, test_features_imputed)
+  
+  # Train new Random Forest with only top 10 features
+  mtry_val <- max(1, floor(sqrt(length(top10_features))))
+  ntree_val <- ifelse(nrow(train_data) < 50, 300, 500)
+  
+  rf_refined <- tryCatch({
+    randomForest(
+      Group ~ .,
+      data = train_data,
+      importance = TRUE,
+      ntree = ntree_val,
+      mtry = mtry_val
+    )
+  }, error = function(e) {
+    cat(paste0("  Error: ", e$message, "\n"))
+    return(NULL)
+  })
+  
+  if(is.null(rf_refined)) {
+    cat("  Skipping this model due to error.\n\n")
+    next
+  }
+  
+  # Store refined model
+  fold_refined_models[[fold_name]] <- rf_refined
+  
+  # Make predictions on TEST data
+  test_predictions <- predict(rf_refined, test_data, type = "response")
+  test_probabilities <- NULL
+  if(length(levels(group)) == 2) {
+    test_probabilities <- predict(rf_refined, test_data, type = "prob")
+    fold_probabilities[[fold_name]] <- test_probabilities
+  }
+  
+  # Store predictions
+  fold_predictions[[fold_name]] <- list(
+    true = test_data$Group,
+    pred = test_predictions
+  )
+  
+  # Calculate TEST performance
+  test_perf_refined <- calculate_performance(test_predictions, test_data$Group, test_probabilities)
+  
+  # Also calculate TRAINING performance for overfitting check
+  train_predictions <- predict(rf_refined, train_data, type = "response")
+  train_probabilities <- NULL
+  if(length(levels(group)) == 2) {
+    train_probabilities <- predict(rf_refined, train_data, type = "prob")
+  }
+  train_perf_refined <- calculate_performance(train_predictions, train_data$Group, train_probabilities)
+  
+  # Store refined overfitting metrics
+  refined_overfitting <- data.frame(
+    Fold = fold_num,
+    Train_Accuracy = train_perf_refined$Accuracy,
+    Test_Accuracy = test_perf_refined$Accuracy,
+    Accuracy_Gap = train_perf_refined$Accuracy - test_perf_refined$Accuracy
+  )
+  fold_refined_overfitting[[fold_name]] <- refined_overfitting
+  
+  # Create performance dataframe
+  perf <- data.frame(
+    Fold = fold_num,
+    Accuracy = test_perf_refined$Accuracy,
+    Sensitivity = test_perf_refined$Sensitivity,
+    Specificity = test_perf_refined$Specificity,
+    Precision = test_perf_refined$Precision,
+    Recall = test_perf_refined$Sensitivity,
+    F1 = test_perf_refined$F1,
+    AUC = test_perf_refined$AUC
+  )
+  
+  fold_performance[[fold_name]] <- perf
+  
+  cat(paste0("  Test Accuracy: ", round(perf$Accuracy * 100, 2), "%\n"))
+  cat(paste0("  Test Sensitivity: ", round(perf$Sensitivity * 100, 2), "%\n"))
+  cat(paste0("  Test Specificity: ", round(perf$Specificity * 100, 2), "%\n"))
+  if(!is.na(perf$AUC)) {
+    cat(paste0("  Test AUC: ", round(perf$AUC, 3), "\n"))
+  }
+  cat("\n")
+}
+
+
+# Merge Performance Metrics
+
+cat("\n=== STEP 4: Performance Summary Across All Folds ===\n\n")
+
+# Combine all performance metrics
+performance_df <- do.call(rbind, fold_performance)
+rownames(performance_df) <- NULL
+
+# Calculate mean and SD for each metric
+summary_stats <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Precision", "Recall", "F1", "AUC"),
+  Mean = c(
+    mean(performance_df$Accuracy, na.rm = TRUE),
+    mean(performance_df$Sensitivity, na.rm = TRUE),
+    mean(performance_df$Specificity, na.rm = TRUE),
+    mean(performance_df$Precision, na.rm = TRUE),
+    mean(performance_df$Recall, na.rm = TRUE),
+    mean(performance_df$F1, na.rm = TRUE),
+    mean(performance_df$AUC, na.rm = TRUE)
+  ),
+  SD = c(
+    sd(performance_df$Accuracy, na.rm = TRUE),
+    sd(performance_df$Sensitivity, na.rm = TRUE),
+    sd(performance_df$Specificity, na.rm = TRUE),
+    sd(performance_df$Precision, na.rm = TRUE),
+    sd(performance_df$Recall, na.rm = TRUE),
+    sd(performance_df$F1, na.rm = TRUE),
+    sd(performance_df$AUC, na.rm = TRUE)
+  )
+)
+
+cat("Performance Metrics Summary (Mean ± SD):\n")
+print(summary_stats)
+cat("\n")
+
+cat("Performance Metrics by Fold:\n")
+print(performance_df)
+cat("\n")
+
+
+# Find Common Features Across All Fold Models
+
+
+cat("\n=== STEP 5: Finding Common Features Across Folds ===\n\n")
+
+# Print top 10 features from each fold
+cat("Top 10 features from each fold:\n")
+for(fold_name in names(fold_top10_features)) {
+  cat(paste0("\nFold ", fold_name, ":\n"))
+  print(fold_top10_features[[fold_name]])
+}
+cat("\n")
+
+# Count frequency of each feature across folds
+feature_count <- table(unlist(fold_top10_features))
+feature_count_df <- data.frame(
+  Feature = names(feature_count),
+  Count = as.numeric(feature_count),
+  Percentage = round(as.numeric(feature_count) / length(fold_top10_features) * 100, 1)
+)
+feature_count_df <- feature_count_df[order(-feature_count_df$Count), ]
+
+cat("Feature Frequency Across All Folds:\n")
+print(feature_count_df)
+cat("\n")
+
+# Common features (appearing in at least 50% of folds)
+threshold <- ceiling(length(fold_top10_features) / 2)
+common_features_50plus <- feature_count_df$Feature[feature_count_df$Count >= threshold]
+cat(paste0("Features appearing in at least ", threshold, " folds (≥50%):\n"))
+print(common_features_50plus)
+cat("\n")
+
+# Features appearing in ALL folds
+common_features_all <- feature_count_df$Feature[feature_count_df$Count == length(fold_top10_features)]
+cat(paste0("Features appearing in ALL ", length(fold_top10_features), " folds:\n"))
+if(length(common_features_all) > 0) {
+  print(common_features_all)
+} else {
+  cat("No features appeared in all folds.\n")
+}
+cat("\n")
+
+
+# NEW SECTION: MDA ANALYSIS FOR COMMON FEATURES
+
+
+cat("\n=== STEP 5B: MDA Analysis for Common Features ===\n\n")
+
+# aggregate MDA scores across folds
+aggregate_mda_scores <- function(feature_list, fold_importance_list) {
+  mda_summary <- data.frame()
+  
+  for(feature in feature_list) {
+    mda_scores <- c()
+    
+    # Collect MDA scores from each fold where feature appears
+    for(fold_name in names(fold_importance_list)) {
+      importance_df <- fold_importance_list[[fold_name]]
+      if(feature %in% importance_df$Feature) {
+        mda_score <- importance_df$Importance[importance_df$Feature == feature]
+        mda_scores <- c(mda_scores, mda_score)
+      }
+    }
+    
+    if(length(mda_scores) > 0) {
+      # Calculate statistics
+      feature_summary <- data.frame(
+        Feature = feature,
+        Mean_MDA = mean(mda_scores),
+        SD_MDA = sd(mda_scores),
+        Min_MDA = min(mda_scores),
+        Max_MDA = max(mda_scores),
+        N_Folds = length(mda_scores),
+        Percentage_Folds = round(length(mda_scores) / length(fold_importance_list) * 100, 1)
+      )
+      
+      mda_summary <- rbind(mda_summary, feature_summary)
+    }
+  }
+  
+  # Sort by Mean_MDA descending
+  mda_summary <- mda_summary[order(-mda_summary$Mean_MDA), ]
+  
+  return(mda_summary)
+}
+
+# Function to interpret MDA importance
+interpret_mda <- function(mda_value) {
+  if(mda_value > 20) {
+    return(" High")
+  } else if(mda_value >= 10) {
+    return("High")
+  } else if(mda_value >= 5) {
+    return("oderate")
+  } else {
+    return("Low")
+  }
+}
+
+# Only analyze features appearing in ≥80% of folds
+cat("=== MDA Analysis for Features Appearing in ≥80% of Folds ===\n\n")
+
+# Calculate threshold for 80%
+threshold_80 <- ceiling(length(fold_top10_features) * 0.8)
+features_80plus <- feature_count_df$Feature[feature_count_df$Count >= threshold_80]
+
+cat(sprintf("Threshold: %d out of %d folds (≥80%%)\n", 
+            threshold_80, length(fold_top10_features)))
+cat(sprintf("Features meeting threshold: %d\n\n", length(features_80plus)))
+
+if(length(features_80plus) > 0) {
+  mda_80plus <- aggregate_mda_scores(features_80plus, fold_importance)
+  mda_80plus$Importance_Level <- sapply(mda_80plus$Mean_MDA, interpret_mda)
+  
+  cat("MDA Summary (sorted by Mean MDA):\n")
+  print(mda_80plus)
+  cat("\n")
+  
+  cat("Detailed Interpretation:\n")
+  for(i in 1:nrow(mda_80plus)) {
+    cat(sprintf("%d. %s\n", i, mda_80plus$Feature[i]))
+    cat(sprintf("   Mean MDA: %.2f ± %.2f (appears in %.1f%% of folds)\n", 
+                mda_80plus$Mean_MDA[i], 
+                mda_80plus$SD_MDA[i],
+                mda_80plus$Percentage_Folds[i]))
+    cat(sprintf("   Range: [%.2f - %.2f]\n", 
+                mda_80plus$Min_MDA[i], 
+                mda_80plus$Max_MDA[i]))
+    cat(sprintf("   Importance: %s\n\n", 
+                mda_80plus$Importance_Level[i]))
+  }
+  
+  # Top features by MDA
+  cat("Top 10 Features by Mean MDA Score (≥80% folds):\n")
+  top10_mda <- head(mda_80plus, 10)
+  for(i in 1:nrow(top10_mda)) {
+    cat(sprintf("%2d. %-40s MDA=%.2f (%s)\n", 
+                i, 
+                top10_mda$Feature[i], 
+                top10_mda$Mean_MDA[i],
+                top10_mda$Importance_Level[i]))
+  }
+  cat("\n")
+} else {
+  cat("No features appeared in ≥80% of folds.\n\n")
+  mda_80plus <- NULL
+}
+
+# Also keep analysis for ALL folds (100%) if any exist
+if(length(common_features_all) > 0) {
+  cat("=== MDA Analysis for Features Appearing in ALL Folds (100%) ===\n\n")
+  
+  mda_all_folds <- aggregate_mda_scores(common_features_all, fold_importance)
+  mda_all_folds$Importance_Level <- sapply(mda_all_folds$Mean_MDA, interpret_mda)
+  
+  cat(paste0("Features analyzed: ", nrow(mda_all_folds), "\n\n"))
+  
+  cat("MDA Summary (sorted by Mean MDA):\n")
+  print(mda_all_folds)
+  cat("\n")
+} else {
+  cat("No features appeared in 100% of folds.\n\n")
+  mda_all_folds <- NULL
+}
+
+# rfPermute Significance Testing for ≥80% Features
+
+
+cat("\n=== STEP 5C: Statistical Significance Testing with rfPermute (p < 0.05) ===\n\n")
+
+# Only proceed if we have features appearing in ≥80% of folds
+if(!is.null(mda_80plus) && nrow(mda_80plus) > 0) {
+  
+  cat(sprintf("Testing %d features that appear in ≥80%% of folds...\n\n", 
+              nrow(mda_80plus)))
+  
+  # Load rfPermute library
+  if(!require("rfPermute")) {
+    cat("Installing rfPermute package...\n")
+    install.packages("rfPermute")
+    library(rfPermute)
+  }
+  
+  # Get the list of features to test (from ≥80% analysis)
+  features_to_test <- mda_80plus$Feature
+  
+  cat(sprintf("Features to test: %d\n", length(features_to_test)))
+  cat("Running permutation test (this may take a few minutes)...\n\n")
+  
+  # Prepare full dataset with only these features
+  # Use the filtered features (after initial filtering)
+  test_features <- features_filtered[, features_to_test]
+  
+  # Apply same preprocessing as in cross-validation
+  cat("Preprocessing data for permutation test...\n")
+  test_features_log <- apply_log_transform(test_features)
+  lod_values_full <- calculate_lod(test_features_log)
+  test_features_imputed <- impute_with_lod(test_features_log, lod_values_full)
+  
+  # Remove any samples with remaining NAs
+  complete_cases <- complete.cases(test_features_imputed)
+  test_features_clean <- test_features_imputed[complete_cases, ]
+  group_clean <- group[complete_cases]
+  
+  # Combine with group
+  dat_permute <- cbind(Group = group_clean, test_features_clean)
+  
+  cat(sprintf("Final dataset: %d samples, %d features\n\n", 
+              nrow(dat_permute), ncol(test_features_clean)))
+  
+  # Run rfPermute
+  cat("Running Random Forest with permutation testing...\n")
+  cat("(Using 1000 trees and 100 permutations)\n\n")
+  
+  set.seed(123)
+  rfp <- tryCatch({
+    rfPermute(
+      Group ~ .,
+      data = dat_permute,
+      ntree = 1000,
+      num.rep = 1000,  # Number of permutations
+      importance = TRUE
+    )
+  }, error = function(e) {
+    cat(paste0("Error in rfPermute: ", e$message, "\n"))
+    return(NULL)
+  })
+  
+  if(!is.null(rfp)) {
+    # Extract importance with p-values
+    imp <- rfPermute::importance(rfp, scale = FALSE)
+    
+    # Get p-values (they're in the columns ending with ".pval")
+    pval_col <- grep("pval", colnames(imp), value = TRUE)[1]
+    
+    # Create results dataframe
+    rfp_results <- data.frame(
+      Feature = rownames(imp),
+      MDA = imp[, 1],  # Mean Decrease Accuracy
+      pvalue = imp[, pval_col],
+      Significant = imp[, pval_col] < 0.05
+    )
+    
+    # Sort by p-value
+    rfp_results <- rfp_results[order(rfp_results$pvalue), ]
+    
+    # Identify statistically significant features
+    significant_features <- rfp_results$Feature[rfp_results$Significant]
+    
+    cat("\n")
+    cat(rep("=", 80), "\n", sep = "")
+    cat("PERMUTATION TEST RESULTS\n")
+    cat(rep("=", 80), "\n", sep = "")
+    cat(sprintf("Total features tested: %d\n", nrow(rfp_results)))
+    cat(sprintf("Statistically significant (p < 0.05): %d (%.1f%%)\n\n",
+                length(significant_features),
+                length(significant_features) / nrow(rfp_results) * 100))
+    
+    cat("Top 20 features by p-value:\n")
+    cat(rep("-", 80), "\n", sep = "")
+    cat(sprintf("%-4s %-50s %12s %8s %s\n", 
+                "Rank", "Feature", "MDA", "p-value", "Sig"))
+    cat(rep("-", 80), "\n", sep = "")
+    
+    top_n <- min(20, nrow(rfp_results))
+    for(i in 1:top_n) {
+      sig_symbol <- ifelse(rfp_results$Significant[i], "***", "")
+      cat(sprintf("%-4d %-50s %12.2f %8.4f %s\n",
+                  i,
+                  rfp_results$Feature[i],
+                  rfp_results$MDA[i],
+                  rfp_results$pvalue[i],
+                  sig_symbol))
+    }
+    cat("\n")
+    
+    if(length(significant_features) > 0) {
+      cat("Statistically significant features (p < 0.05):\n")
+      cat(rep("-", 80), "\n", sep = "")
+      for(i in 1:length(significant_features)) {
+        idx <- which(rfp_results$Feature == significant_features[i])
+        cat(sprintf("%2d. %-50s p = %.4f, MDA = %.2f\n",
+                    i,
+                    significant_features[i],
+                    rfp_results$pvalue[idx],
+                    rfp_results$MDA[idx]))
+      }
+      cat("\n")
+    } else {
+      cat("  WARNING: No features reached statistical significance (p < 0.05)\n\n")
+    }
+    
+    # Merge with MDA analysis to compare
+    mda_with_pval <- merge(mda_80plus, rfp_results[, c("Feature", "pvalue", "Significant")],
+                           by = "Feature", all.x = TRUE)
+    mda_with_pval <- mda_with_pval[order(mda_with_pval$pvalue), ]
+    
+    # Save results
+    rfp_results_file <- file.path(analysis_dir, "rfPermute_Significance_Test.csv")
+    write.csv(rfp_results, rfp_results_file, row.names = FALSE)
+    cat(paste0("Permutation test results saved: ", rfp_results_file, "\n"))
+    
+    mda_with_pval_file <- file.path(analysis_dir, "MDA_with_Significance.csv")
+    write.csv(mda_with_pval, mda_with_pval_file, row.names = FALSE)
+    cat(paste0("MDA with p-values saved: ", mda_with_pval_file, "\n\n"))
+    
+    # Create visualization
+    sig_plot_file <- file.path(analysis_dir, "Feature_Significance_Plot.png")
+    png(sig_plot_file, width = 10, height = 6, units = "in", res = 300)
+    
+    par(mar = c(5, 15, 4, 2))
+    
+    # Plot top 20 features
+    top_20 <- head(rfp_results, 20)
+    colors <- ifelse(top_20$Significant, "lightskyblue", "gray60")
+    
+    barplot(-log10(top_20$pvalue),
+            horiz = TRUE,
+            names.arg = top_20$Feature,
+            las = 1,
+            col = colors,
+            xlab = "-log10(p-value)",
+            main = "Feature Significance",
+            cex.names = 2,   # feature names
+            cex.axis = 2,   # axis ticks
+            cex.lab  = 2,   # axis label
+            cex.main = 2.3)   # title
+    
+    abline(v = -log10(0.05), col = "red", lty = 2, lwd = 2)
+    text(-log10(0.05), 1, "p = 0.05", pos = 4, col = "red", cex = 1.0)
+    
+    # Add legend outside
+    #legend("topright", inset = c(-0.03, 0),  # negative x inset moves it outside
+           #legend = c("Significant (p < 0.05)", "Not Significant"),
+           #fill = c("lightskyblue", "gray60"),
+           #cex = 1.0,
+           #xpd = NA)  # allows plotting outside plot region
+    
+    dev.off()
+    
+    cat(paste0("Significance plot saved: ", sig_plot_file, "\n\n"))
+    
+  } else {
+    cat("⚠️  rfPermute failed - skipping significance testing.\n\n")
+    rfp_results <- NULL
+    significant_features <- NULL
+  }
+  
+} else {
+  cat("No features in ≥80% of folds - skipping rfPermute test.\n\n")
+  rfp_results <- NULL
+  significant_features <- NULL
+}
+
+cat("=== Statistical Significance Testing Complete ===\n\n")
+
+# GENERATE ROC CURVES WITH YOUDEN INDEX - ENHANCED VERSION
+
+
+cat("\n=== STEP 6: Generating ROC Curves ===\n\n")
+
+# Check if binary classification
+if(length(levels(group)) == 2) {
+  
+  # Check if we have probability predictions
+  if(length(fold_probabilities) > 0) {
+    
+    cat("Creating combined ROC curve plot with all folds and Youden Index...\n")
+    
+    # Set up colors for different folds
+    library(RColorBrewer)
+    n_folds_with_results <- length(fold_probabilities)
+    fold_colors <- brewer.pal(min(n_folds_with_results, 9), "Set1")
+    if(n_folds_with_results > 9) {
+      fold_colors <- colorRampPalette(brewer.pal(9, "Set1"))(n_folds_with_results)
+    }
+    
+    # Storage for ROC data
+    roc_list <- list()
+    auc_values <- numeric()
+    youden_values <- numeric()
+    youden_sens <- numeric()
+    youden_spec <- numeric()
+    fold_names <- character()
+    
+    # Process each fold
+    for(i in seq_along(fold_probabilities)) {
+      fold_name <- names(fold_probabilities)[i]
+      fold_num <- as.numeric(fold_name)
+      
+      # Get true labels and predictions
+      true_labels <- fold_predictions[[fold_name]]$true
+      probabilities <- fold_probabilities[[fold_name]]
+      
+      # Create ROC object
+      roc_obj <- roc(as.numeric(true_labels), probabilities[, 2], quiet = TRUE)
+      auc_val <- auc(roc_obj)
+      
+      # Calculate Youden Index
+      youden_index <- roc_obj$sensitivities + roc_obj$specificities - 1
+      best_idx <- which.max(youden_index)
+      best_youden <- youden_index[best_idx]
+      best_sens <- roc_obj$sensitivities[best_idx]
+      best_spec <- roc_obj$specificities[best_idx]
+      best_threshold <- roc_obj$thresholds[best_idx]
+      
+      # Store for legend
+      roc_list[[fold_name]] <- roc_obj
+      auc_values <- c(auc_values, auc_val)
+      youden_values <- c(youden_values, best_youden)
+      youden_sens <- c(youden_sens, best_sens)
+      youden_spec <- c(youden_spec, best_spec)
+      fold_names <- c(fold_names, paste0("Fold ", fold_num))
+      
+      # Print Youden info
+      cat(sprintf("Fold %d: Youden Index = %.3f (Sens=%.3f, Spec=%.3f, Threshold=%.4f)\n",
+                  fold_num, best_youden, best_sens, best_spec, best_threshold))
+    }
+    
+    # Calculate mean AUC and Youden
+    mean_auc <- mean(auc_values)
+    sd_auc <- sd(auc_values)
+    mean_youden <- mean(youden_values)
+    sd_youden <- sd(youden_values)
+    
+    # Create legend text for later use
+    legend_text <- paste0(fold_names, ": AUC=", sprintf("%.3f", auc_values), 
+                          ", J=", sprintf("%.3f", youden_values))
+    legend_text <- c(legend_text, 
+                     "",
+                     sprintf("Mean AUC: %.3f ± %.3f", mean_auc, sd_auc),
+                     sprintf("Mean Youden: %.3f ± %.3f", mean_youden, sd_youden),
+                     "",
+                     "● = Youden optimal point")
+    
+   
+    # CREATE MAIN ROC PLOT WITHOUT LEGEND
+
+    
+    roc_plot_file <- file.path(analysis_dir, "ROC_Curves_All_Folds.png")
+    png(roc_plot_file, width = 6, height = 6, units = "in", res = 300)
+    
+    par(mar = c(6, 6, 5, 2))
+    
+    # Initialize plot with larger fonts
+    plot(0, 0, type = "n", xlim = c(0, 1), ylim = c(0, 1),
+         xlab = "False Positive Rate (1 - Specificity)",
+         ylab = "True Positive Rate (Sensitivity)",
+         main = "ROC Curves_PDAC vs GC",
+         cex.lab = 2.0, cex.axis = 1.8, cex.main = 2.2)
+    
+    # Add diagonal reference line
+    abline(a = 0, b = 1, lty = 2, col = "gray50", lwd = 3)
+    
+    # Plot each fold's ROC curve
+    for(i in seq_along(fold_probabilities)) {
+      fold_name <- names(fold_probabilities)[i]
+      roc_obj <- roc_list[[fold_name]]
+      
+      # Plot ROC curve
+      lines(1 - roc_obj$specificities, roc_obj$sensitivities,
+            col = fold_colors[i], lwd = 3.5)
+      
+      # Mark Youden point
+      youden_index <- roc_obj$sensitivities + roc_obj$specificities - 1
+      best_idx <- which.max(youden_index)
+      best_sens <- roc_obj$sensitivities[best_idx]
+      best_spec <- roc_obj$specificities[best_idx]
+      
+      points(1 - best_spec, best_sens, 
+             col = fold_colors[i], pch = 19, cex = 2.0)
+    }
+    
+
+    dev.off()
+    
+    roc_plot_file <- file.path(analysis_dir, "ROC_Curves_All_Folds.png")
+    png(roc_plot_file, width = 6, height = 6, units = "in", res = 300)  # Made wider for legend
+    
+    par(mar = c(6, 6, 5, 2))
+    
+    # Initialize plot ######################################################################################################## final edit
+    plot(0, 0, type = "n", xlim = c(0, 1), ylim = c(0, 1),
+         xlab = "False Positive Rate (1 - Specificity)",
+         ylab = "True Positive Rate (Sensitivity)",
+         main = "ROC Curves_PDAC vs GC",
+         cex.lab = 2.0, cex.axis = 1.8, cex.main = 2.2)
+    
+    # Add diagonal reference line
+    abline(a = 0, b = 1, lty = 2, col = "gray50", lwd = 3)
+    
+    # Plot each fold's ROC curve
+    for(i in seq_along(fold_probabilities)) {
+      fold_name <- names(fold_probabilities)[i]
+      roc_obj <- roc_list[[fold_name]]
+      
+      # Plot ROC curve
+      lines(1 - roc_obj$specificities, roc_obj$sensitivities,
+            col = fold_colors[i], lwd = 3.5)
+      
+      # Mark Youden point
+      youden_index <- roc_obj$sensitivities + roc_obj$specificities - 1
+      best_idx <- which.max(youden_index)
+      best_sens <- roc_obj$sensitivities[best_idx]
+      best_spec <- roc_obj$specificities[best_idx]
+      
+      points(1 - best_spec, best_sens, 
+             col = fold_colors[i], pch = 19, cex = 2.0)
+    }
+    
+
+    legend_labels <- paste0("Fold ", 1:length(fold_probabilities))
+    
+
+    legend("bottomright",
+           legend = legend_labels,
+           col = fold_colors[1:length(fold_probabilities)],
+           lwd = 3.5,
+           cex = 1.5,
+           bg = "white",
+           bty = "n",
+           title.cex = 1.2)
+    
+    dev.off()
+    
+    cat(paste0("\nROC curve plot with legend saved: ", roc_plot_file, "\n"))
+    
+    cat(paste0("\nROC curve plot (without legend) saved: ", roc_plot_file, "\n"))
+    
+
+    # CREATE SEPARATE LEGEND FILE
+
+    
+    legend_file <- file.path(analysis_dir, "ROC_Legend.png")
+    png(legend_file, width = 6, height = 6, units = "in", res = 300)
+    
+    par(mar = c(1, 1, 3, 1))
+    plot.new()
+    
+    legend("center",
+           legend = legend_text,
+           col = c(fold_colors[1:length(fold_names)], NA, "black", "black", NA, "black"),
+           lty = c(rep(1, length(fold_names)), NA, NA, NA, NA, NA),
+           lwd = c(rep(3.5, length(fold_names)), NA, NA, NA, NA, NA),
+           pch = c(rep(NA, length(fold_names)), NA, NA, NA, NA, 19),
+           pt.cex = 2.0,
+           cex = 1.8,
+           title = "Fold Performance",
+           title.cex = 2.0,
+           bty = "n")
+    
+    dev.off()
+    
+    cat(paste0("Legend saved separately: ", legend_file, "\n"))
+    
+
+    # Print summary
+
+    
+    cat(sprintf("\nMean AUC across all folds: %.3f ± %.3f\n", mean_auc, sd_auc))
+    cat(sprintf("AUC Range: [%.3f - %.3f]\n", min(auc_values), max(auc_values)))
+    cat(sprintf("Mean Youden Index: %.3f ± %.3f\n", mean_youden, sd_youden))
+    cat(sprintf("Youden Range: [%.3f - %.3f]\n\n", min(youden_values), max(youden_values)))
+    
+
+    # Create individual ROC plots for each fold
+
+    
+    cat("Creating individual ROC curve plots for each fold...\n")
+    
+    individual_roc_dir <- file.path(analysis_dir, "Individual_ROC_Curves")
+    dir.create(individual_roc_dir, recursive = TRUE, showWarnings = FALSE)
+    
+    for(i in seq_along(fold_probabilities)) {
+      fold_name <- names(fold_probabilities)[i]
+      fold_num <- as.numeric(fold_name)
+      
+      # Get data
+      true_labels <- fold_predictions[[fold_name]]$true
+      probabilities <- fold_probabilities[[fold_name]]
+      
+      # Create ROC object
+      roc_obj <- roc(as.numeric(true_labels), probabilities[, 2], quiet = TRUE)
+      auc_val <- auc(roc_obj)
+      
+      # Get confusion matrix data
+      pred_labels <- fold_predictions[[fold_name]]$pred
+      cm <- confusionMatrix(pred_labels, true_labels)
+      
+      # Create plot with larger fonts
+      individual_plot_file <- file.path(individual_roc_dir, 
+                                        paste0("ROC_Fold_", fold_num, ".png"))
+      png(individual_plot_file, width = 10, height = 10, units = "in", res = 300)
+      
+      par(mar = c(6, 6, 5, 2))
+      
+      plot(1 - roc_obj$specificities, roc_obj$sensitivities,
+           type = "l", col = fold_colors[i], lwd = 4,
+           xlim = c(0, 1), ylim = c(0, 1),
+           xlab = "False Positive Rate (1 - Specificity)",
+           ylab = "True Positive Rate (Sensitivity)",
+           main = paste0("ROC Curve - Fold ", fold_num),
+           cex.lab = 2.0, cex.axis = 1.8, cex.main = 2.2)
+      
+      # Add diagonal
+      abline(a = 0, b = 1, lty = 2, col = "gray50", lwd = 3)
+      
+      # Add grid
+      grid(col = "gray80", lty = 2)
+      
+      # Add performance metrics text
+      metrics_text <- c(
+        sprintf("AUC: %.3f", auc_val),
+        sprintf("Accuracy: %.2f%%", cm$overall['Accuracy'] * 100),
+        sprintf("Sensitivity: %.2f%%", cm$byClass['Sensitivity'] * 100),
+        sprintf("Specificity: %.2f%%", cm$byClass['Specificity'] * 100)
+      )
+      
+      legend("bottomright",
+             legend = metrics_text,
+             bty = "n",
+             cex = 1.8)
+      
+      dev.off()
+    }
+    
+    cat(paste0("Individual ROC plots saved to: ", individual_roc_dir, "\n\n"))
+    
+
+    # Save ROC data to CSV
+
+    
+    cat("Saving ROC curve data...\n")
+    
+    # Create summary table with Youden Index
+    roc_summary <- data.frame(
+      Fold = as.numeric(names(fold_probabilities)),
+      AUC = auc_values,
+      Youden_Index = youden_values,
+      Youden_Sensitivity = youden_sens,
+      Youden_Specificity = youden_spec,
+      Accuracy = sapply(names(fold_probabilities), function(fn) {
+        performance_df$Accuracy[performance_df$Fold == as.numeric(fn)]
+      }),
+      Sensitivity = sapply(names(fold_probabilities), function(fn) {
+        performance_df$Sensitivity[performance_df$Fold == as.numeric(fn)]
+      }),
+      Specificity = sapply(names(fold_probabilities), function(fn) {
+        performance_df$Specificity[performance_df$Fold == as.numeric(fn)]
+      })
+    )
+    
+    roc_summary_file <- file.path(analysis_dir, "ROC_Summary.csv")
+    write.csv(roc_summary, roc_summary_file, row.names = FALSE)
+    cat(paste0("ROC summary saved: ", roc_summary_file, "\n\n"))
+    
+    # Save detailed ROC coordinates for each fold
+    roc_coords_dir <- file.path(analysis_dir, "ROC_Coordinates")
+    dir.create(roc_coords_dir, recursive = TRUE, showWarnings = FALSE)
+    
+    for(fold_name in names(roc_list)) {
+      fold_num <- as.numeric(fold_name)
+      roc_obj <- roc_list[[fold_name]]
+      
+      roc_coords <- data.frame(
+        FPR = 1 - roc_obj$specificities,
+        TPR = roc_obj$sensitivities,
+        Threshold = roc_obj$thresholds
+      )
+      
+      coords_file <- file.path(roc_coords_dir, 
+                               paste0("ROC_Coordinates_Fold_", fold_num, ".csv"))
+      write.csv(roc_coords, coords_file, row.names = FALSE)
+    }
+    
+    cat(paste0("ROC coordinates saved to: ", roc_coords_dir, "\n"))
+    
+  } else {
+    cat("Warning: No probability predictions available for ROC curves.\n")
+    cat("This might occur if models failed during training.\n")
+  }
+  
+} else {
+  cat("ROC curves are only applicable for binary classification.\n")
+  cat(paste0("Your data has ", length(levels(group)), " classes.\n"))
+  cat("Consider using other visualization methods for multi-class classification.\n")
+}
+
+cat("\n=== ROC Curve Generation Complete ===\n\n")
+
+
+# SAVE ALL RESULTS TO FILES
+
+
+cat("\n=== STEP 7: Saving All Results to Files ===\n\n")
+
+# 1. Save overfitting metrics (initial models)
+overfitting_file <- file.path(analysis_dir, "Overfitting_Metrics_Initial_Models.csv")
+write.csv(overfitting_df, overfitting_file, row.names = FALSE)
+cat(paste0("1. Initial model overfitting metrics saved: ", overfitting_file, "\n"))
+
+# 2. Save refined model overfitting metrics
+if(length(fold_refined_overfitting) > 0) {
+  refined_overfitting_df <- do.call(rbind, fold_refined_overfitting)
+  rownames(refined_overfitting_df) <- NULL
+  refined_overfitting_file <- file.path(analysis_dir, "Overfitting_Metrics_Refined_Models.csv")
+  write.csv(refined_overfitting_df, refined_overfitting_file, row.names = FALSE)
+  cat(paste0("2. Refined model overfitting metrics saved: ", refined_overfitting_file, "\n"))
+}
+
+# 3. Save performance metrics
+performance_file <- file.path(analysis_dir, "Performance_Metrics_By_Fold.csv")
+write.csv(performance_df, performance_file, row.names = FALSE)
+cat(paste0("3. Performance metrics by fold saved: ", performance_file, "\n"))
+
+# 4. Save summary statistics
+summary_file <- file.path(analysis_dir, "Performance_Summary_Statistics.csv")
+write.csv(summary_stats, summary_file, row.names = FALSE)
+cat(paste0("4. Performance summary statistics saved: ", summary_file, "\n"))
+
+# 5. Save feature frequency across folds
+feature_freq_file <- file.path(analysis_dir, "Feature_Frequency_Across_Folds.csv")
+write.csv(feature_count_df, feature_freq_file, row.names = FALSE)
+cat(paste0("5. Feature frequency saved: ", feature_freq_file, "\n"))
+
+# 6. Save top 10 features from each fold
+top10_dir <- file.path(analysis_dir, "Top10_Features_By_Fold")
+dir.create(top10_dir, recursive = TRUE, showWarnings = FALSE)
+
+for(fold_name in names(fold_top10_features)) {
+  fold_num <- as.numeric(fold_name)
+  top10_df <- data.frame(
+    Rank = 1:length(fold_top10_features[[fold_name]]),
+    Feature = fold_top10_features[[fold_name]]
+  )
+  
+  top10_file <- file.path(top10_dir, paste0("Top10_Features_Fold_", fold_num, ".csv"))
+  write.csv(top10_df, top10_file, row.names = FALSE)
+}
+cat(paste0("6. Top 10 features by fold saved to: ", top10_dir, "\n"))
+
+# 7. Save common features
+common_features_file <- file.path(analysis_dir, "Common_Features.txt")
+sink(common_features_file)
+cat("=" , rep("=", 78), "\n", sep = "")
+cat("COMMON FEATURES ACROSS FOLDS\n")
+cat("=" , rep("=", 78), "\n\n", sep = "")
+
+cat(paste0("Total number of folds analyzed: ", length(fold_top10_features), "\n\n"))
+
+cat("Features appearing in ALL folds:\n")
+cat(rep("-", 80), "\n", sep = "")
+if(length(common_features_all) > 0) {
+  for(i in seq_along(common_features_all)) {
+    cat(sprintf("%2d. %s\n", i, common_features_all[i]))
+  }
+} else {
+  cat("None\n")
+}
+cat("\n")
+
+cat(paste0("Features appearing in at least ", threshold, " folds (≥80%):\n"))
+cat(rep("-", 80), "\n", sep = "")
+for(i in seq_along(common_features_50plus)) {
+  freq <- feature_count_df$Count[feature_count_df$Feature == common_features_50plus[i]]
+  pct <- feature_count_df$Percentage[feature_count_df$Feature == common_features_50plus[i]]
+  cat(sprintf("%2d. %-50s [%d/%d folds, %.1f%%]\n", 
+              i, common_features_50plus[i], freq, length(fold_top10_features), pct))
+}
+sink()
+cat(paste0("7. Common features saved: ", common_features_file, "\n"))
+
+# 8. Save MDA analysis results
+if(!is.null(mda_all_folds)) {
+  mda_all_file <- file.path(analysis_dir, "MDA_Analysis_100_Percent_Folds.csv")
+  write.csv(mda_all_folds, mda_all_file, row.names = FALSE)
+  cat(paste0("8. MDA analysis (100% of folds) saved: ", mda_all_file, "\n"))
+}
+
+if(!is.null(mda_80plus)) {
+  mda_80plus_file <- file.path(analysis_dir, "MDA_Analysis_80_Percent_Folds.csv")
+  write.csv(mda_80plus, mda_80plus_file, row.names = FALSE)
+  cat(paste0("9. MDA analysis (≥80% folds) saved: ", mda_80plus_file, "\n"))
+} else {
+  cat("9. No features appeared in ≥80% of folds - MDA file not created.\n")
+}
+
+# 9. Save complete importance scores from each fold
+importance_dir <- file.path(analysis_dir, "Full_Importance_Scores_By_Fold")
+dir.create(importance_dir, recursive = TRUE, showWarnings = FALSE)
+
+for(fold_name in names(fold_importance)) {
+  fold_num <- as.numeric(fold_name)
+  importance_file <- file.path(importance_dir, 
+                               paste0("Importance_Scores_Fold_", fold_num, ".csv"))
+  write.csv(fold_importance[[fold_name]], importance_file, row.names = FALSE)
+}
+cat(paste0("10. Full importance scores saved to: ", importance_dir, "\n"))
+
+# 10. Create comprehensive summary report
+summary_report_file <- file.path(analysis_dir, "Analysis_Summary_Report.txt")
+sink(summary_report_file)
+
+cat("=" , rep("=", 78), "\n", sep = "")
+cat("RANDOM FOREST BIOMARKER ANALYSIS - COMPREHENSIVE SUMMARY REPORT\n")
+cat("=" , rep("=", 78), "\n\n", sep = "")
+
+cat("Analysis Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+cat("Output Directory:", analysis_dir, "\n\n")
+
+cat(rep("-", 80), "\n", sep = "")
+cat("DATA SUMMARY\n")
+cat(rep("-", 80), "\n", sep = "")
+cat(sprintf("Total samples: %d\n", nrow(features_filtered)))
+cat(sprintf("Initial features: %d\n", ncol(features)))
+cat(sprintf("Features after filtering (≤80%% missing): %d\n", ncol(features_filtered)))
+cat(sprintf("Groups: %s\n", paste(levels(group), collapse = ", ")))
+cat(sprintf("Group distribution: %s\n", paste(names(table(group)), "=", table(group), collapse = ", ")))
+cat(sprintf("Cross-validation folds: %d\n\n", n_folds))
+
+cat(rep("-", 80), "\n", sep = "")
+cat("PERFORMANCE SUMMARY (Mean ± SD)\n")
+cat(rep("-", 80), "\n", sep = "")
+for(i in 1:nrow(summary_stats)) {
+  metric <- summary_stats$Metric[i]
+  mean_val <- summary_stats$Mean[i]
+  sd_val <- summary_stats$SD[i]
+  
+  if(!is.na(mean_val)) {
+    if(metric == "AUC") {
+      cat(sprintf("%-15s: %.3f ± %.3f\n", metric, mean_val, sd_val))
+    } else {
+      cat(sprintf("%-15s: %.2f%% ± %.2f%%\n", metric, mean_val * 100, sd_val * 100))
+    }
+  }
+}
+cat("\n")
+
+cat(rep("-", 80), "\n", sep = "")
+cat("OVERFITTING ANALYSIS\n")
+cat(rep("-", 80), "\n", sep = "")
+cat(sprintf("Mean Training Accuracy: %.2f%% ± %.2f%%\n", 
+            mean_train_acc * 100, 
+            sd(overfitting_df$Train_Accuracy, na.rm = TRUE) * 100))
+cat(sprintf("Mean Test Accuracy:     %.2f%% ± %.2f%%\n", 
+            mean_test_acc * 100, 
+            sd(overfitting_df$Test_Accuracy, na.rm = TRUE) * 100))
+cat(sprintf("Mean Overfitting Gap:   %.2f%% ± %.2f%%\n\n", 
+            mean_gap * 100, 
+            sd(overfitting_df$Accuracy_Gap, na.rm = TRUE) * 100))
+
+if(mean_gap > 0.15) {
+  cat(" WARNING: Model shows HIGH overfitting across folds.\n")
+  cat("   Recommendation: Consider reducing model complexity or feature selection.\n\n")
+} else if(mean_gap > 0.10) {
+  cat(" CAUTION: Model shows MODERATE overfitting.\n")
+  cat("   Recommendation: Additional feature selection may improve generalization.\n\n")
+} else if(mean_gap > 0.05) {
+  cat(" Model shows SLIGHT overfitting - generally acceptable.\n\n")
+} else {
+  cat(" EXCELLENT: Model generalizes well with minimal overfitting.\n\n")
+}
+
+cat(rep("-", 80), "\n", sep = "")
+cat("TOP FEATURES BY MEAN MDA SCORE\n")
+cat(rep("-", 80), "\n", sep = "")
+top_n <- min(20, nrow(mda_80plus))
+for(i in 1:top_n) {
+  cat(sprintf("%2d. %-45s MDA=%.2f ± %.2f (%s)\n", 
+              i,
+              mda_80plus$Feature[i],
+              mda_80plus$Mean_MDA[i],
+              mda_80plus$SD_MDA[i],
+              mda_80plus$Importance_Level[i]))
+}
+cat("\n")
+
+cat(rep("-", 80), "\n", sep = "")
+cat("FEATURE STABILITY ACROSS FOLDS\n")
+cat(rep("-", 80), "\n", sep = "")
+cat(sprintf("Features appearing in ALL %d folds: %d\n", 
+            length(fold_top10_features), 
+            length(common_features_all)))
+cat(sprintf("Features appearing in ≥80%% of folds: %d\n\n", 
+            length(common_features_50plus)))
+
+if(length(common_features_all) > 0) {
+  cat("Most stable features (appearing in ALL folds):\n")
+  for(i in seq_along(common_features_all)) {
+    cat(sprintf("  %d. %s\n", i, common_features_all[i]))
+  }
+  cat("\n")
+}
+
+cat(rep("-", 80), "\n", sep = "")
+cat("FILES GENERATED\n")
+cat(rep("-", 80), "\n", sep = "")
+cat("1. Overfitting_Metrics_Initial_Models.csv\n")
+cat("2. Overfitting_Metrics_Refined_Models.csv\n")
+cat("3. Performance_Metrics_By_Fold.csv\n")
+cat("4. Performance_Summary_Statistics.csv\n")
+cat("5. Feature_Frequency_Across_Folds.csv\n")
+cat("6. Top10_Features_By_Fold/ (folder)\n")
+cat("7. Common_Features.txt\n")
+cat("8. MDA_Analysis_All_Folds.csv\n")
+cat("9. MDA_Analysis_50Plus_Folds.csv\n")
+cat("10. Full_Importance_Scores_By_Fold/ (folder)\n")
+if(length(levels(group)) == 2) {
+  cat("11. ROC_Curves_All_Folds.png\n")
+  cat("12. Individual_ROC_Curves/ (folder)\n")
+  cat("13. ROC_Summary.csv\n")
+  cat("14. ROC_Coordinates/ (folder)\n")
+}
+cat("\n")
+
+cat("=" , rep("=", 78), "\n", sep = "")
+cat("END OF REPORT\n")
+cat("=" , rep("=", 78), "\n", sep = "")
+
+sink()
+cat(paste0("11. Comprehensive summary report saved: ", summary_report_file, "\n\n"))
+
+cat("=" , rep("=", 78), "\n", sep = "")
+cat("ANALYSIS COMPLETE!\n")
+cat("=" , rep("=", 78), "\n\n", sep = "")
+cat(paste0("All results saved to: ", analysis_dir, "\n\n"))
+cat("Summary of key findings:\n")
+cat(sprintf("- Mean Test Accuracy: %.2f%% ± %.2f%%\n", 
+            mean_test_acc * 100, 
+            sd(overfitting_df$Test_Accuracy, na.rm = TRUE) * 100))
+if(length(levels(group)) == 2 && length(auc_values) > 0) {
+  cat(sprintf("- Mean AUC: %.3f ± %.3f\n", mean(auc_values), sd(auc_values)))
+}
+cat(sprintf("- Overfitting Gap: %.2f%%\n", mean_gap * 100))
+cat(sprintf("- Most stable features: %d features appeared in ≥80%% of folds\n", 
+            length(common_features_50plus)))
+cat("\n")
